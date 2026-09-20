@@ -30,14 +30,13 @@ def latent_hw(height: int, width: int) -> tuple[int, int]:
     return height // 16, width // 16
 
 
-def text_ctx(paths: Paths, cfg: Config, prompt: str) -> jax.Array:
+def encode_ctx(text_params: dict, cfg: Config, prompt: str) -> jax.Array:
     """Prompt -> `ctx (1,512,7680)`. The 512 tokens are always full, padding included."""
-    params = loader.load_text(paths.text_index, cfg.text)
-    return jax.jit(encode, static_argnames=("cfg",))(params, cfg.text, tokenize(prompt))
+    return jax.jit(encode, static_argnames=("cfg",))(text_params, cfg.text, tokenize(prompt))
 
 
-def denoise_latent(
-    paths: Paths,
+def denoise_from(
+    dit_params: dict,
     cfg: Config,
     ctx: jax.Array,
     height: int,
@@ -50,7 +49,6 @@ def denoise_latent(
     `noise` injects a captured draw `(1,128,h,w)` — the parity path, where reproducing torch's
     CUDA RNG is infeasible (project.md §8.2 item 8) — otherwise `key` draws one in JAX.
     """
-    params = loader.load_dit(paths.dit, cfg.dit)
     h, w = latent_hw(height, width)
     if noise is None:
         noise = jax.random.normal(key, (1, cfg.dit.in_channels, h, w), jnp.float32).astype(jnp.bfloat16)
@@ -59,15 +57,41 @@ def denoise_latent(
     ctx_ids = jnp.asarray(rope.txt_ids(config.MAX_LENGTH))
     steps = config.timesteps(cfg.num_steps, h * w)
     fn = jax.jit(sampling.denoise, static_argnames=("cfg", "steps"))
-    return fn(params, cfg.dit, x, x_ids, ctx, ctx_ids, steps)[0]
+    return fn(dit_params, cfg.dit, x, x_ids, ctx, ctx_ids, steps)[0]
+
+
+def decode_from(vae_params: dict, cfg: Config, latent: jax.Array, height: int, width: int) -> jax.Array:
+    """Final latent -> `(1,3,H,W)` in [-1,1]."""
+    h, w = latent_hw(height, width)
+    z = sampling.unpack(latent, h, w)
+    return jax.jit(vae_decode, static_argnames=("cfg",))(vae_params, z, cfg.vae)
+
+
+# The three stage loaders. On 16 GiB (v5e-1) the components do **not** co-reside — DiT 7.75 GB +
+# Qwen3 5.45 GB + VAE 0.1 GB — so the staged functions below load, run, and drop. On 32 GiB
+# (v6e-1) `load_all`/`generate_resident` keep everything alive and take weight staging out of the
+# latency path entirely, which matters because staging measured 37x the compute on an L4
+# (`docs/roofline.md` §7).
+
+
+def text_ctx(paths: Paths, cfg: Config, prompt: str) -> jax.Array:
+    return encode_ctx(loader.load_text(paths.text_index, cfg.text), cfg, prompt)
+
+
+def denoise_latent(
+    paths: Paths,
+    cfg: Config,
+    ctx: jax.Array,
+    height: int,
+    width: int,
+    key: jax.Array | None = None,
+    noise: jax.Array | None = None,
+) -> jax.Array:
+    return denoise_from(loader.load_dit(paths.dit, cfg.dit), cfg, ctx, height, width, key, noise)
 
 
 def decode(paths: Paths, cfg: Config, latent: jax.Array, height: int, width: int) -> jax.Array:
-    """Final latent -> `(1,3,H,W)` in [-1,1]."""
-    params = load_vae(paths.vae, cfg.vae)
-    h, w = latent_hw(height, width)
-    z = sampling.unpack(latent, h, w)
-    return jax.jit(vae_decode, static_argnames=("cfg",))(params, z, cfg.vae)
+    return decode_from(load_vae(paths.vae, cfg.vae), cfg, latent, height, width)
 
 
 def to_uint8(image: np.ndarray) -> np.ndarray:
@@ -85,7 +109,44 @@ def generate(
     seed: int = 0,
     noise: jax.Array | None = None,
 ) -> np.ndarray:
-    """One prompt -> one `(H,W,3)` uint8 image."""
+    """One prompt -> one `(H,W,3)` uint8 image, staging the weights (the 16 GiB shape)."""
     ctx = text_ctx(paths, cfg, prompt)
     latent = denoise_latent(paths, cfg, ctx, height, width, jax.random.key(seed), noise)
     return to_uint8(decode(paths, cfg, latent, height, width))
+
+
+@dataclasses.dataclass(frozen=True)
+class Resident:
+    """Every component loaded at once — the 32 GiB (v6e-1) serving shape."""
+
+    text: dict
+    dit: dict
+    vae: dict
+
+
+def load_all(paths: Paths, cfg: Config) -> Resident:
+    """Load all three components and keep them. ~13.3 GB of weights: fits v6e-1, not v5e-1."""
+    return Resident(
+        text=loader.load_text(paths.text_index, cfg.text),
+        dit=loader.load_dit(paths.dit, cfg.dit),
+        vae=load_vae(paths.vae, cfg.vae),
+    )
+
+
+def generate_resident(
+    resident: Resident,
+    cfg: Config,
+    prompt: str,
+    height: int = 512,
+    width: int = 512,
+    seed: int = 0,
+    noise: jax.Array | None = None,
+) -> np.ndarray:
+    """One prompt with nothing left to load — the second and subsequent requests of a server.
+
+    The difference against `generate` is not arithmetic, it is the absence of ~13 GB of device
+    transfers on the critical path.
+    """
+    ctx = encode_ctx(resident.text, cfg, prompt)
+    latent = denoise_from(resident.dit, cfg, ctx, height, width, jax.random.key(seed), noise)
+    return to_uint8(decode_from(resident.vae, cfg, latent, height, width))
