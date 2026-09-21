@@ -15,6 +15,8 @@ The key set is asserted in **both** directions — a missing key and an unexpect
 hard errors, because a `ShapeDtypeStruct`-template loader silently no-ops otherwise (§9.1).
 """
 
+import functools
+import inspect
 import json
 import pathlib as pl
 
@@ -27,6 +29,14 @@ from .config import Klein4B, Qwen3_4B
 
 Array = jax.Array
 Tree = dict[str, Array]
+
+# `backend="pread"` makes `safe_open` read lazily from disk instead of mapping the whole file, which
+# is the measured 1.24x-RAM path here. It is only accepted from safetensors 0.5 on, and the reference
+# images pin 0.4.5 for the BFL checkout, so feature-detect rather than require it.
+_PREAD = "backend" in inspect.signature(safe_open).parameters
+open_np = functools.partial(
+    safe_open, framework="np", **({"backend": "pread"} if _PREAD else {})
+)
 
 
 def header(path: str) -> dict[str, tuple[str, tuple[int, ...]]]:
@@ -42,7 +52,7 @@ def load_flat(path: str, expected: set[str], transpose: tuple[str, ...] = ("weig
     `safe_open(backend="pread")` + `get_tensor` one at a time is the measured 1.24x-host-RAM
     path — never `load_file`.
     """
-    with safe_open(path, framework="np", backend="pread") as f:
+    with open_np(path) as f:
         found = set(f.keys()) - set(ignore)
         missing, extra = expected - found, found - expected
         assert not missing, f"{len(missing)} key(s) missing from {path}: {sorted(missing)[:5]}"
@@ -163,7 +173,7 @@ def load_text(index_path: str, cfg: Qwen3_4B) -> Tree:
     flat: Tree = {}
     for shard in sorted({weight_map[k] for k in expected}):
         keys = sorted(k for k in expected if weight_map[k] == shard)
-        with safe_open(str(pl.Path(index_path).parent / shard), framework="np", backend="pread") as f:
+        with open_np(str(pl.Path(index_path).parent / shard)) as f:
             # the embedding is a lookup table, not a Linear: it must not be transposed
             flat |= {
                 k: f.get_tensor(k) if k == EMBED_KEY else _orient(f.get_tensor(k), k, ("weight",))
