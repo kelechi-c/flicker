@@ -33,6 +33,8 @@ def embed_nd(ids: Array, axes_dim: tuple[int, ...] = (32, 32, 32, 32), theta: fl
     Axes are concatenated on the frequency axis, then a **head** axis of size 1 is inserted so
     the table broadcasts over all 24 heads.
     """
+    if ids.ndim == 2:
+        ids = ids[None]
     per_axis = [rope_freqs(ids[..., i], axes_dim[i], theta) for i in range(len(axes_dim))]
     return jnp.concatenate(per_axis, axis=-3)[:, None]
 

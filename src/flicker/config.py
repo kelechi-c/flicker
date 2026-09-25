@@ -1,7 +1,6 @@
-"""FLUX.2 [klein] 4B — architecture constants, repo ids, schedule constants.
-
-The raw BFL safetensors carry no config, so the architecture is a hardcoded dataclass
-(`refs/flux2/src/flux2/model.py:38-49`). Only the 4B numbers are used here.
+""" 
+constants, repo ids, etc.
+FLUX.2 [klein] 4B model configs source: `flux2/src/flux2/model.py:38-49`. 
 """
 
 import math
@@ -38,15 +37,16 @@ class Klein4B:
     """DiT shape. `theta` is the rope base (not a time constant); head_dim = 3072/24 = 128."""
 
     in_channels: int = 128
-    context_in_dim: int = 7680  # 3 x 2560 (qwen3 hidden)
+    context_in_dim: int = 7680  # 3 (chosen layers) x 2560 (qwen3 hidden state), stacked
     hidden_size: int = 3072
     num_heads: int = 24
     depth: int = 5
     depth_single_blocks: int = 20
+    block_unroll: int = 1  # static scan variant; 1 preserves the original graph
     axes_dim: tuple[int, ...] = (32, 32, 32, 32)
     theta: int = 2000
     mlp_ratio: float = 3.0
-    use_guidance_embed: bool = False  # 4B: guidance is inert, no guidance_in weights
+    use_guidance_embed: bool = False
 
     @property
     def head_dim(self) -> int:
@@ -56,11 +56,9 @@ class Klein4B:
     def mlp_hidden(self) -> int:
         return int(self.hidden_size * self.mlp_ratio)
 
-
+# only taps features form 3 layers, last layer being 27 (no need to run layers 28-36)
 @dataclass(frozen=True)
 class Qwen3_4B:
-    """Text encoder trunk. We only ever run layers 0..26 — the tap at hidden_states[27]."""
-
     hidden_size: int = 2560
     num_layers: int = 36
     num_heads: int = 32
@@ -75,11 +73,9 @@ class Qwen3_4B:
     def layers_needed(self) -> int:
         return max(TAP_LAYERS)  # 27: hidden_states[k] = output of layer k-1
 
-
+# diffusers `AutoencoderKLFlux2` decoder
 @dataclass(frozen=True)
 class VAE:
-    """diffusers `AutoencoderKLFlux2` decoder. bf16 weights; stats also bf16."""
-
     ch: int = 128
     ch_mult: tuple[int, ...] = (1, 2, 4, 4)
     num_res_blocks: int = 2
@@ -122,11 +118,9 @@ def _shift(t: float, exp_mu: np.float32, sigma: float = 1.0) -> float:
         exp_mu / (exp_mu + (np.float32(1.0) / np.float32(t) - np.float32(1.0)) ** np.float32(sigma))
     )
 
-
+# main flicker pipeline config
 @dataclass(frozen=True)
 class Config:
-    """Everything the pipeline needs in one immutable record."""
-
     dit: Klein4B = field(default_factory=Klein4B)
     text: Qwen3_4B = field(default_factory=Qwen3_4B)
     vae: VAE = field(default_factory=VAE)

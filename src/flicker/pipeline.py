@@ -5,6 +5,7 @@ Each function loads only the weights it needs, which is what makes the 1-chip TP
 """
 
 import dataclasses
+from typing import Sequence
 
 import jax
 import jax.numpy as jnp
@@ -30,8 +31,8 @@ def latent_hw(height: int, width: int) -> tuple[int, int]:
     return height // 16, width // 16
 
 
-def encode_ctx(text_params: dict, cfg: Config, prompt: str) -> jax.Array:
-    """Prompt -> `ctx (1,512,7680)`. The 512 tokens are always full, padding included."""
+def encode_ctx(text_params: dict, cfg: Config, prompt: str | Sequence[str]) -> jax.Array:
+    """Prompt -> `ctx (B,512,7680)`. The 512 tokens are always full, padding included."""
     return jax.jit(encode, static_argnames=("cfg",))(text_params, cfg.text, tokenize(prompt))
 
 
@@ -43,19 +44,27 @@ def denoise_from(
     width: int,
     key: jax.Array | None = None,
     noise: jax.Array | None = None,
-) -> jax.Array:
-    """Noise -> final latent `(1,L,128)`, four Euler steps in one scanned `jit`.
+    return_trajectory: bool = False,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """Noise -> final latent `(B,L,128)`, four Euler steps in one scanned `jit`.
 
-    `noise` injects a captured draw `(1,128,h,w)` — the parity path, where reproducing torch's
+    `noise` injects a captured draw `(B,128,h,w)` — the parity path, where reproducing torch's
     CUDA RNG is infeasible (project.md §8.2 item 8) — otherwise `key` draws one in JAX.
+    When `return_trajectory=True`, returns `(final_latent, trajectory)` where `trajectory`
+    has shape `(T,B,L,128)` packed bf16 post-Euler carries.
     """
     h, w = latent_hw(height, width)
     if noise is None:
-        noise = jax.random.normal(key, (1, cfg.dit.in_channels, h, w), jnp.float32).astype(jnp.bfloat16)
+        b = ctx.shape[0]
+        noise = jax.random.normal(key, (b, cfg.dit.in_channels, h, w), jnp.float32).astype(jnp.bfloat16)
     x = sampling.pack(noise)
     x_ids = jnp.asarray(rope.img_ids(h, w))
     ctx_ids = jnp.asarray(rope.txt_ids(config.MAX_LENGTH))
     steps = config.timesteps(cfg.num_steps, h * w)
+    if return_trajectory:
+        fn = jax.jit(sampling.denoise_trajectory, static_argnames=("cfg", "steps"))
+        traj = fn(dit_params, cfg.dit, x, x_ids, ctx, ctx_ids, steps)
+        return traj[-1], traj
     fn = jax.jit(sampling.denoise, static_argnames=("cfg", "steps"))
     return fn(dit_params, cfg.dit, x, x_ids, ctx, ctx_ids, steps)[0]
 
@@ -97,7 +106,12 @@ def decode(paths: Paths, cfg: Config, latent: jax.Array, height: int, width: int
 def to_uint8(image: np.ndarray) -> np.ndarray:
     """`(127.5 * (x + 1)).byte()` — clamp then **truncate**, not round (project.md §8.2)."""
     clipped = np.clip(np.asarray(image, np.float32), -1.0, 1.0)
-    return np.clip(127.5 * (clipped + 1.0), 0, 255).astype(np.uint8)[0].transpose(1, 2, 0)
+    arr = np.clip(127.5 * (clipped + 1.0), 0, 255).astype(np.uint8)
+    if arr.ndim == 4 and arr.shape[0] == 1:
+        return arr[0].transpose(1, 2, 0)
+    if arr.ndim == 4:
+        return arr.transpose(0, 2, 3, 1)
+    return arr
 
 
 def generate(
@@ -136,13 +150,13 @@ def load_all(paths: Paths, cfg: Config) -> Resident:
 def generate_resident(
     resident: Resident,
     cfg: Config,
-    prompt: str,
+    prompt: str | Sequence[str],
     height: int = 512,
     width: int = 512,
     seed: int = 0,
     noise: jax.Array | None = None,
 ) -> np.ndarray:
-    """One prompt with nothing left to load — the second and subsequent requests of a server.
+    """One or more prompts with nothing left to load — the second and subsequent requests of a server.
 
     The difference against `generate` is not arithmetic, it is the absence of ~13 GB of device
     transfers on the critical path.

@@ -15,7 +15,7 @@ hardcoded, so no `transformers` and no torch in the core path.
 
 import functools
 import json
-from typing import NamedTuple
+from typing import NamedTuple, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -37,34 +37,43 @@ class Tokens(NamedTuple):
     mask: Array
 
 
+TOKENIZER_REVISION = "e7b7dc27f91deacad38e78976d1f2b499d76a294"  # same 4B revision as the weights
+
+
 @functools.lru_cache(maxsize=1)
-def load_tokenizer() -> tuple[Tokenizer, int]:
+def load_tokenizer(revision: str | None = None) -> tuple[Tokenizer, int]:
     """Rust tokenizer + the pad id, straight from the repo — no transformers, no torch."""
-    config = json.loads(
-        open(hf_hub_download(REPO, f"{TOKENIZER_SUBDIR}/tokenizer_config.json")).read()
-    )
-    tokenizer = Tokenizer.from_file(hf_hub_download(REPO, f"{TOKENIZER_SUBDIR}/tokenizer.json"))
+    rev = revision or TOKENIZER_REVISION
+    kwargs = {"revision": rev} if rev else {}
+    cfg_file = hf_hub_download(REPO, f"{TOKENIZER_SUBDIR}/tokenizer_config.json", **kwargs)
+    tok_file = hf_hub_download(REPO, f"{TOKENIZER_SUBDIR}/tokenizer.json", **kwargs)
+    config = json.loads(open(cfg_file).read())
+    tokenizer = Tokenizer.from_file(tok_file)
     # `pad_token_id` is not in the config: it stores the *string*, and the id lives in the vocab
     return tokenizer, int(tokenizer.token_to_id(config["pad_token"]))
 
 
-def tokenize(prompt: str) -> Tokens:
+def tokenize(prompt: str | Sequence[str]) -> Tokens:
     """Render the chat template, tokenize, right-pad/truncate to 512.
 
     The rendered string is `CHAT_TEMPLATE` byte-for-byte (asserted in Stage A); 12 tokens of
     overhead leaves ~500 for the prompt and longer prompts are **silently truncated**.
     """
     tokenizer, pad_id = load_tokenizer()
-    ids = tokenizer.encode(CHAT_TEMPLATE.format(prompt=prompt), add_special_tokens=False).ids
-    ids = ids[:MAX_LENGTH]
-    mask = [1] * len(ids) + [0] * (MAX_LENGTH - len(ids))
-    ids = ids + [pad_id] * (MAX_LENGTH - len(ids))
-    return Tokens(jnp.asarray([ids], jnp.int32), jnp.asarray([mask], jnp.int32))
+    prompts = [prompt] if isinstance(prompt, str) else list(prompt)
+    all_ids, all_masks = [], []
+    for p in prompts:
+        ids = tokenizer.encode(CHAT_TEMPLATE.format(prompt=p), add_special_tokens=False).ids[:MAX_LENGTH]
+        mask = [1] * len(ids) + [0] * (MAX_LENGTH - len(ids))
+        ids = ids + [pad_id] * (MAX_LENGTH - len(ids))
+        all_ids.append(ids)
+        all_masks.append(mask)
+    return Tokens(jnp.asarray(all_ids, jnp.int32), jnp.asarray(all_masks, jnp.int32))
 
 
 def embed(p: dict[str, Array], ids: Array) -> Array:
-    """`model.embed_tokens` lookup for a single batch element: (1,S) ids -> (1,S,2560)."""
-    return p["embed_tokens"]["weight"][ids[0]][None]
+    """`model.embed_tokens` lookup: (B,S) ids -> (B,S,2560)."""
+    return p["embed_tokens"]["weight"][ids]
 
 
 def rope_tables(positions: Array, head_dim: int, theta: float) -> tuple[Array, Array]:
