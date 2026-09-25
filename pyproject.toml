@@ -1,6 +1,6 @@
 [project]
 name = "flicker"
-version = "0.1.0"
+version = "0.2.0"
 description = "JAX/TPU port of FLUX.2 [klein] 4B — text-to-image inference"
 requires-python = ">=3.12"
 dependencies = [
@@ -17,6 +17,10 @@ dependencies = [
 # torch/transformers live only in the Modal reference image and in tools/ stage-A goldens.
 ref = ["torch", "transformers", "einops", "modal"]
 test = ["pytest"]
+# LPIPS/DINOv2 scoring only (tools/quality_metrics.py), never the JAX serving path. pyiqa 0.1.16 is
+# pinned because scores are not comparable across versions; it requires transformers>=5.0, so this
+# is a separate environment from `ref` (transformers 4.56.1).
+quality = ["torch>=2.8", "pyiqa==0.1.16", "transformers>=5.0", "pillow", "safetensors"]
 
 [build-system]
 requires = ["hatchling"]
