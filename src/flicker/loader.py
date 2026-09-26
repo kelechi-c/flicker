@@ -126,14 +126,14 @@ def dit_keys(cfg: Klein4B) -> set[str]:
 
 
 def load_dit(path: str, cfg: Klein4B) -> Tree:
-    """Stream the DiT checkpoint into the scan-ready pytree."""
+    """Stream the DiT checkpoint into the scan-ready pytree of device arrays."""
     flat = load_flat(path, dit_keys(cfg))
     blocks = {
         "double_blocks": stack_blocks(flat, "double_blocks", cfg.depth),
         "single_blocks": stack_blocks(flat, "single_blocks", cfg.depth_single_blocks),
     }
     top = {k: v for k, v in flat.items() if not k.startswith(("double_blocks.", "single_blocks."))}
-    return nest(top) | blocks
+    return jax.device_put(nest(top) | blocks)
 
 
 EMBED_KEY = "model.embed_tokens.weight"
@@ -164,7 +164,7 @@ def load_text(index_path: str, cfg: Qwen3_4B) -> Tree:
     """Stream the two Qwen3 shards through their HF index, keeping only the layers we run.
 
     Each shard is opened once and read with `pread`; only the keys the index maps to it are
-    touched, so the 9 unused layers are never materialised.
+    touched, so the 9 unused layers are never materialised. Returns device arrays.
     """
     weight_map = json.loads(pl.Path(index_path).read_text())["weight_map"]
     expected = text_keys(cfg)
@@ -179,7 +179,7 @@ def load_text(index_path: str, cfg: Qwen3_4B) -> Tree:
                 k: f.get_tensor(k) if k == EMBED_KEY else _orient(f.get_tensor(k), k, ("weight",))
                 for k in keys
             }
-    return {
+    return jax.device_put({
         "embed_tokens": {"weight": flat[EMBED_KEY]},
         "layers": stack_blocks(flat, "model.layers", cfg.layers_needed),
-    }
+    })

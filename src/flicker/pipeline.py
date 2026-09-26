@@ -16,6 +16,13 @@ from .config import Config
 from .text_encoder import encode, tokenize
 from .vae import load_vae, vae_decode
 
+# One trace per stage, built once at import: constructing `jax.jit(...)` per call re-pays the cache
+# lookup and the trace-state bookkeeping on every request.
+_encode = jax.jit(encode, static_argnames=("cfg",))
+_denoise = jax.jit(sampling.denoise, static_argnames=("cfg", "steps"))
+_denoise_trajectory = jax.jit(sampling.denoise_trajectory, static_argnames=("cfg", "steps"))
+_vae_decode = jax.jit(vae_decode, static_argnames=("cfg",))
+
 
 @dataclasses.dataclass(frozen=True)
 class Paths:
@@ -33,7 +40,7 @@ def latent_hw(height: int, width: int) -> tuple[int, int]:
 
 def encode_ctx(text_params: dict, cfg: Config, prompt: str | Sequence[str]) -> jax.Array:
     """Prompt -> `ctx (B,512,7680)`. The 512 tokens are always full, padding included."""
-    return jax.jit(encode, static_argnames=("cfg",))(text_params, cfg.text, tokenize(prompt))
+    return _encode(text_params, cfg.text, tokenize(prompt))
 
 
 def denoise_from(
@@ -62,18 +69,16 @@ def denoise_from(
     ctx_ids = jnp.asarray(rope.txt_ids(config.MAX_LENGTH))
     steps = config.timesteps(cfg.num_steps, h * w)
     if return_trajectory:
-        fn = jax.jit(sampling.denoise_trajectory, static_argnames=("cfg", "steps"))
-        traj = fn(dit_params, cfg.dit, x, x_ids, ctx, ctx_ids, steps)
+        traj = _denoise_trajectory(dit_params, cfg.dit, x, x_ids, ctx, ctx_ids, steps)
         return traj[-1], traj
-    fn = jax.jit(sampling.denoise, static_argnames=("cfg", "steps"))
-    return fn(dit_params, cfg.dit, x, x_ids, ctx, ctx_ids, steps)[0]
+    return _denoise(dit_params, cfg.dit, x, x_ids, ctx, ctx_ids, steps)[0]
 
 
 def decode_from(vae_params: dict, cfg: Config, latent: jax.Array, height: int, width: int) -> jax.Array:
     """Final latent -> `(1,3,H,W)` in [-1,1]."""
     h, w = latent_hw(height, width)
     z = sampling.unpack(latent, h, w)
-    return jax.jit(vae_decode, static_argnames=("cfg",))(vae_params, z, cfg.vae)
+    return _vae_decode(vae_params, z, cfg.vae)
 
 
 # The three stage loaders. On 16 GiB (v5e-1) the components do **not** co-reside — DiT 7.75 GB +

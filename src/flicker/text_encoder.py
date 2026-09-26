@@ -7,6 +7,7 @@ from typing import NamedTuple, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer
@@ -15,13 +16,13 @@ from .config import CHAT_TEMPLATE, MAX_LENGTH, REPO, TAP_LAYERS, TOKENIZER_SUBDI
 from .modules import qwen3_layer
 
 Array = jax.Array
-TAPS_PER_CHUNK = 9  # 27 layers / 3 taps: layers 0-8 -> h[9], 9-17 -> h[18], 18-26 -> h[27]
+ArrayLike = Array | np.ndarray  # host ids/mask are converted by the jit boundary, not eagerly
 TOKENIZER_REVISION = "e7b7dc27f91deacad38e78976d1f2b499d76a294"
 
 
 class Tokens(NamedTuple):
-    ids: Array
-    mask: Array
+    ids: ArrayLike
+    mask: ArrayLike
 
 
 @functools.lru_cache(maxsize=1)
@@ -46,11 +47,11 @@ def tokenize(prompt: str | Sequence[str]) -> Tokens:
         ids = ids + [pad_id] * (MAX_LENGTH - len(ids))
         all_ids.append(ids)
         all_masks.append(mask)
-    return Tokens(jnp.asarray(all_ids, jnp.int32), jnp.asarray(all_masks, jnp.int32))
+    return Tokens(np.asarray(all_ids, np.int32), np.asarray(all_masks, np.int32))
 
 
 # `model.embed_tokens` lookup: (B,S) ids -> (B,S,2560)
-def embed(p: dict[str, Array], ids: Array) -> Array:
+def embed(p: dict[str, Array], ids: ArrayLike) -> Array:
     return p["embed_tokens"]["weight"][ids]
 
 
@@ -62,35 +63,26 @@ def rope_tables(positions: Array, head_dim: int, theta: float) -> tuple[Array, A
     return jnp.cos(emb)[None, None], jnp.sin(emb)[None, None]
 
 
-def causal_mask(mask: Array) -> Array:
-    """Boolean `(B,1,S,S)` keep-mask: causal **and** the padding keys removed.
-
-    Padding positions are real tokens to the DiT, so they are computed — but they must not be
-    attended to. Padding *queries* still attend to the real prefix, exactly as HF does.
-    """
+def causal_mask(mask: ArrayLike) -> Array:
     length = mask.shape[1]
     causal = jnp.tril(jnp.ones((length, length), bool))
     return (mask[:, None, None, :] > 0) & causal
 
 
-# Run layers 0-26 in three scanned chunks and return the three tapped hidden states.
-# 8, 17 and 26 — one chunk boundary for eaach (scan is split in three).
-# `hidden_states[k]` is the output of layer `k-1`, so the taps are the outputs of layers
+# One `lax.scan` over layers 0-26; the body returns its output as the carry and as `ys`, so the
+# taps are plain slices of `ys`. `hidden_states[k]` is the output of layer `k-1`, so tap `k` is
+# `ys[k-1]` (9/18/27 -> the outputs of layers 8/17/26). Three 9-layer scans cost 2.3x this on TPU.
 def trunk(p: dict[str, Array], cfg: Qwen3_4B, tokens: Tokens) -> list[Array]:
     x = embed(p, tokens.ids)
     cos, sin = rope_tables(jnp.arange(MAX_LENGTH), cfg.head_dim, cfg.rope_theta)
     mask = causal_mask(tokens.mask)
 
-    def run(x: Array, params: dict[str, Array]) -> Array:
-        return lax.scan(lambda h, lp: (qwen3_layer(lp, h, cos, sin, mask, cfg), None), x, params)[0]
+    def body(h: Array, lp: dict[str, Array]) -> tuple[Array, Array]:
+        y = qwen3_layer(lp, h, cos, sin, mask, cfg)
+        return y, y
 
-    taps = []
-    for chunk in range(len(TAP_LAYERS)):
-        sl = slice(chunk * TAPS_PER_CHUNK, (chunk + 1) * TAPS_PER_CHUNK)
-        chunked = jax.tree.map(lambda a, sl=sl: a[sl], p["layers"])
-        taps.append(run(x, chunked))
-        x = taps[-1]
-    return taps
+    ys = lax.scan(body, x, p["layers"])[1]
+    return [ys[k - 1] for k in TAP_LAYERS]
 
 
 # `Qwen3Embedder.forward` (`text_encoder.py:383-419`)

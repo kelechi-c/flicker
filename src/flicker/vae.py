@@ -90,7 +90,8 @@ def _group(flat: Params, prefix: str) -> Params:
 
 
 def load_vae(path: str, cfg: VAE) -> Params:
-    """Stream the checkpoint into the torch-named tree, one level of nesting per consuming function.
+    """Stream the checkpoint into the torch-named tree of device arrays, one level of nesting per
+    consuming function.
 
     `p["bn"]["running_var"]`, `p["post_quant_conv"]["weight"]`, `p["decoder"]["conv_in.weight"]`,
     `p["decoder.up_blocks"]["0.resnets.0.conv1.weight"]`. `load_flat` asserts the key set in both
@@ -101,12 +102,12 @@ def load_vae(path: str, cfg: VAE) -> Params:
     assert len(ignored) == ENCODER_TENSORS, f"{ENCODER_TENSORS} encoder tensors expected, {len(ignored)} found"
     flat = load_flat(path, vae_keys(cfg), ignore=IGNORED + ignored)
     decoder = {k: v for k, v in _group(flat, DECODER).items() if not k.startswith("up_blocks.")}
-    return {
+    return jax.device_put({
         "bn": _group(flat, "bn"),
         "post_quant_conv": _group(flat, "post_quant_conv"),
         DECODER: decoder,
         UP_BLOCKS: _group(flat, UP_BLOCKS),
-    }
+    })
 
 
 # ---------------------------------------------------------------------------- layout helpers
