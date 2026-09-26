@@ -47,6 +47,9 @@ class Klein4B:
     theta: int = 2000
     mlp_ratio: float = 3.0
     use_guidance_embed: bool = False
+    # static: it selects a traced kernel, so it must be part of the jit's cache key (D0's
+    # lesson — a rebind of the module global was silently ignored). On CPU "flash" falls back.
+    attention: Literal["sdpa", "flash"] = "flash"
 
     @property
     def head_dim(self) -> int:

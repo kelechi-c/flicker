@@ -4,7 +4,7 @@ from jax import lax
 
 from .config import Klein4B
 from .modules import double_block, last_layer, mlp_embedder, modulation, single_block
-from .nn import linear, timestep_embedding
+from .nn import flash_sdpa, linear, sdpa, timestep_embedding
 from .rope import embed_nd
 
 Array = jax.Array
@@ -24,6 +24,12 @@ def forward(
     ctx: Array,
     ctx_ids: Array,
 ) -> Array:
+    """One t2i velocity prediction. `cfg.attention` picks the attention kernel: the Pallas flash
+    kernel on TPU, plain `sdpa` everywhere else (so CPU tests never need Pallas). Resolved once,
+    here, and threaded into every block — a rebind of the module global is silently ignored by
+    jit's trace cache (D0), and `cfg` is a static argument, so each choice is its own cache entry.
+    """
+    attend = flash_sdpa if cfg.attention == "flash" and jax.default_backend() == "tpu" else sdpa
     vec = mlp_embedder(p["time_in"], timestep_embedding(t, 256))
     mod_img = modulation(p["double_stream_modulation_img"], vec, double=True)
     mod_txt = modulation(p["double_stream_modulation_txt"], vec, double=True)
@@ -36,7 +42,8 @@ def forward(
 
     def one_double(carry: tuple[Array, Array], block: dict[str, Array]) -> tuple[Array, Array]:
         img, txt = carry
-        return double_block(block, img, txt, pe_x, pe_ctx, mod_img, mod_txt, cfg.num_heads), None
+        return double_block(block, img, txt, pe_x, pe_ctx, mod_img, mod_txt, cfg.num_heads,
+                            attend), None
 
     (img, txt), _ = lax.scan(one_double, (img, txt), block_params(p, "double_blocks"), unroll=cfg.block_unroll)
 
@@ -45,7 +52,7 @@ def forward(
     num_txt = ctx.shape[1]
 
     def one_single(x: Array, block: dict[str, Array]) -> tuple[Array, None]:
-        return single_block(block, x, pe, mod_single, cfg.num_heads), None
+        return single_block(block, x, pe, mod_single, cfg.num_heads, attend), None
 
     seq, _ = lax.scan(one_single, seq, block_params(p, "single_blocks"), unroll=cfg.block_unroll)
     return last_layer(p["final_layer"], seq[:, num_txt:], vec)

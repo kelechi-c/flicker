@@ -14,6 +14,7 @@ import jax.numpy as jnp
 
 from .config import Qwen3_4B, VAE
 from .nn import (
+    Attention,
     conv2d,
     group_norm,
     layer_norm,
@@ -145,14 +146,16 @@ def double_block(
     mod_img: Array,
     mod_txt: Array,
     num_heads: int,
+    attend: Attention = sdpa,
 ) -> tuple[Array, Array]:
     """`DoubleStreamBlock.forward_kv_extract` with `num_ref_tokens=0` — i.e. plain forward.
 
     One joint attention over `[txt, img]`, split back immediately, then per-stream residuals
-    with per-stream gates and separate output projections/MLPs.
+    with per-stream gates and separate output projections/MLPs. `attend` is threaded in from
+    `dit.forward` (the TPU flash kernel there, plain `sdpa` on CPU) — never rebound globally.
     """
     state = double_prepare_qkv(p, img, txt, pe, pe_ctx, mod_img, mod_txt, num_heads)
-    attn = merge_heads(sdpa(state.q, state.k, state.v))
+    attn = merge_heads(attend(state.q, state.k, state.v))
     txt_attn, img_attn = attn[:, : state.num_txt], attn[:, state.num_txt :]
 
     img = img + state.img_mod1.gate * linear(img_attn, p["img_attn.proj.weight"])
@@ -197,14 +200,15 @@ def single_prepare_qkv(
     return SingleQKV(q, k, v, mlp, triple.gate)
 
 
-def single_block(p: dict[str, Array], x: Array, pe: Array, mod: Array, num_heads: int) -> Array:
+def single_block(p: dict[str, Array], x: Array, pe: Array, mod: Array, num_heads: int,
+                 attend: Attention = sdpa) -> Array:
     """`SingleStreamBlock.forward_kv_extract` with `num_ref_tokens=0`.
 
     `linear2(cat([attn | silu_gate(mlp)]))`, residual scaled by the gate. `self.scale` in the
-    reference is dead code and is not ported.
+    reference is dead code and is not ported. `attend` is threaded in from `dit.forward`.
     """
     state = single_prepare_qkv(p, x, mod, num_heads, pe)
-    attn = merge_heads(sdpa(state.q, state.k, state.v))
+    attn = merge_heads(attend(state.q, state.k, state.v))
     out = linear(jnp.concatenate([attn, silu_gate(state.mlp)], axis=-1), p["linear2.weight"])
     return x + state.gate * out
 

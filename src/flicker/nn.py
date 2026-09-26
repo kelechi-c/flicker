@@ -6,6 +6,7 @@ are hand-written rather than imported (`docs/port-plan.md` §1). Param leaves ar
 """
 
 import math
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -13,6 +14,7 @@ from jax import lax
 
 Array = jax.Array
 Padding = str
+Attention = Callable[[Array, Array, Array], Array]
 
 
 def linear(x: Array, w: Array) -> Array:
@@ -63,6 +65,35 @@ def sdpa(q: Array, k: Array, v: Array, mask: Array | None = None) -> Array:
         logits = jnp.where(mask, logits, -jnp.inf)
     weights = jax.nn.softmax(logits, axis=-1)
     return jnp.einsum("bhls,bhsd->bhld", weights, vf).astype(v.dtype)
+
+
+def flash_sdpa(q: Array, k: Array, v: Array) -> Array:
+    """DiT attention on the Pallas TPU flash kernel: the LxL scores are never materialised.
+
+    `sdpa` writes a `(24, 4608, 4608)` fp32 score buffer per block (2.04 GB, ~800 GB of traffic
+    per image) — D0 measured that as the DiT's dominant cost. This kernel streams K/V in tiles
+    with an online softmax and emits only `(B, H, L, 128)`. Tiling is D0's measured winner
+    (q2304/m1536/k1536 on `(B, H, L, D)` bf16: 2.01x on the 4-step DiT, 55.4 dB vs an fp32
+    reference). The Pallas import is inside the function so a CPU import of this module stays
+    free, and `sm_scale` is the same `1/sqrt(D)` `sdpa` uses.
+    """
+    import jax.experimental.pallas.ops.tpu.flash_attention as flash
+
+    length = q.shape[2]
+    if length % 128:  # no legal tile (e.g. 1360x768 -> 4592 tokens): keep the XLA path
+        return sdpa(q, k, v)
+    block_q = tile(length, (2304, 1536, 1152, 512, 256, 128))
+    block_k = tile(length, (1536, 1152, 512, 256, 128))
+    return flash.flash_attention(
+        q, k, v, causal=False, sm_scale=1.0 / math.sqrt(q.shape[-1]),
+        block_sizes=flash.BlockSizes(block_q=block_q, block_k_major=block_k, block_k=block_k,
+                                     block_b=1))
+
+
+def tile(length: int, sizes: tuple[int, ...]) -> int:
+    """The largest tile in `sizes` that divides `length`: the kernel rejects non-dividing tiles and
+    the DiT's joint length changes with resolution (1024²: 4608 -> 2304/1536, D0's winner)."""
+    return next(size for size in sizes if length % size == 0)
 
 
 def conv2d(x: Array, w: Array, stride: int = 1, padding: Padding = "SAME") -> Array:
