@@ -1,17 +1,5 @@
-"""Qwen3-4B text encoder, bf16, **27 of 36 layers** — we tap `hidden_states[9, 18, 27]`.
-
-Reference: `refs/flux2/src/flux2/text_encoder.py:366-428` (which loads the FP8 checkpoint) and
-`transformers` 4.56.1's `models/qwen3/modeling_qwen3.py`, which is where the numerics were read
-from. Two of its cast points are *not* the DiT's:
-
-* `Qwen3RMSNorm` — fp32 compute, cast back to bf16, **then** multiply by the bf16 weight.
-* rope — `Qwen3RotaryEmbedding` returns `cos/sin` **cast to the model dtype**, so the whole
-  rotation (`q*cos + rotate_half(q)*sin`) is bf16. This is the NeoX **half-split** convention,
-  the opposite of the DiT's interleaved pairs.
-
-The tokenizer is the Rust one (`tokenizers.Tokenizer.from_file`) with the chat template
-hardcoded, so no `transformers` and no torch in the core path.
-"""
+# Qwen3-4B text encoder, bf16, **27 of 36 layers**. tap `hidden_states[9, 18, 27]`.
+# Reference: `flux2/src/flux2/text_encoder.py:366-428` (which loads the FP8 checkpoint)
 
 import functools
 import json
@@ -28,37 +16,27 @@ from .modules import qwen3_layer
 
 Array = jax.Array
 TAPS_PER_CHUNK = 9  # 27 layers / 3 taps: layers 0-8 -> h[9], 9-17 -> h[18], 18-26 -> h[27]
+TOKENIZER_REVISION = "e7b7dc27f91deacad38e78976d1f2b499d76a294"
 
 
 class Tokens(NamedTuple):
-    """Always exactly `MAX_LENGTH` tokens, right-padded — padding is **kept**, never trimmed."""
-
     ids: Array
     mask: Array
 
 
-TOKENIZER_REVISION = "e7b7dc27f91deacad38e78976d1f2b499d76a294"  # same 4B revision as the weights
-
-
 @functools.lru_cache(maxsize=1)
 def load_tokenizer(revision: str | None = None) -> tuple[Tokenizer, int]:
-    """Rust tokenizer + the pad id, straight from the repo — no transformers, no torch."""
     rev = revision or TOKENIZER_REVISION
     kwargs = {"revision": rev} if rev else {}
     cfg_file = hf_hub_download(REPO, f"{TOKENIZER_SUBDIR}/tokenizer_config.json", **kwargs)
     tok_file = hf_hub_download(REPO, f"{TOKENIZER_SUBDIR}/tokenizer.json", **kwargs)
     config = json.loads(open(cfg_file).read())
     tokenizer = Tokenizer.from_file(tok_file)
-    # `pad_token_id` is not in the config: it stores the *string*, and the id lives in the vocab
+    # `pad_token_id` is not in the config: it stores the *string*, and the id lives in the vocab.
     return tokenizer, int(tokenizer.token_to_id(config["pad_token"]))
 
 
 def tokenize(prompt: str | Sequence[str]) -> Tokens:
-    """Render the chat template, tokenize, right-pad/truncate to 512.
-
-    The rendered string is `CHAT_TEMPLATE` byte-for-byte (asserted in Stage A); 12 tokens of
-    overhead leaves ~500 for the prompt and longer prompts are **silently truncated**.
-    """
     tokenizer, pad_id = load_tokenizer()
     prompts = [prompt] if isinstance(prompt, str) else list(prompt)
     all_ids, all_masks = [], []
@@ -71,25 +49,17 @@ def tokenize(prompt: str | Sequence[str]) -> Tokens:
     return Tokens(jnp.asarray(all_ids, jnp.int32), jnp.asarray(all_masks, jnp.int32))
 
 
+# `model.embed_tokens` lookup: (B,S) ids -> (B,S,2560)
 def embed(p: dict[str, Array], ids: Array) -> Array:
-    """`model.embed_tokens` lookup: (B,S) ids -> (B,S,2560)."""
     return p["embed_tokens"]["weight"][ids]
 
 
+# `Qwen3RotaryEmbedding.forward`: fp32 frequencies, `cos/sin`
 def rope_tables(positions: Array, head_dim: int, theta: float) -> tuple[Array, Array]:
-    """`Qwen3RotaryEmbedding.forward`: fp32 frequencies, `cos/sin` **cast to the model dtype**."""
     inv_freq = 1.0 / (theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
     angles = positions.astype(jnp.float32)[:, None] * inv_freq[None]
     emb = jnp.concatenate([angles, angles], axis=-1)
     return jnp.cos(emb)[None, None], jnp.sin(emb)[None, None]
-
-
-
-
-
-
-
-
 
 
 def causal_mask(mask: Array) -> Array:
@@ -103,20 +73,15 @@ def causal_mask(mask: Array) -> Array:
     return (mask[:, None, None, :] > 0) & causal
 
 
-
-
+# Run layers 0-26 in three scanned chunks and return the three tapped hidden states.
+# 8, 17 and 26 — one chunk boundary for eaach (scan is split in three).
+# `hidden_states[k]` is the output of layer `k-1`, so the taps are the outputs of layers
 def trunk(p: dict[str, Array], cfg: Qwen3_4B, tokens: Tokens) -> list[Array]:
-    """Run layers 0-26 in three scanned chunks and return the three tapped hidden states.
-
-    `hidden_states[k]` is the output of layer `k-1`, so the taps are the outputs of layers
-    8, 17 and 26 — one chunk boundary each, which is why the scan is split in three.
-    """
     x = embed(p, tokens.ids)
     cos, sin = rope_tables(jnp.arange(MAX_LENGTH), cfg.head_dim, cfg.rope_theta)
     mask = causal_mask(tokens.mask)
 
     def run(x: Array, params: dict[str, Array]) -> Array:
-        """Nine layers in one scan; `params` is the stacked subtree for this chunk."""
         return lax.scan(lambda h, lp: (qwen3_layer(lp, h, cos, sin, mask, cfg), None), x, params)[0]
 
     taps = []
@@ -128,6 +93,6 @@ def trunk(p: dict[str, Array], cfg: Qwen3_4B, tokens: Tokens) -> list[Array]:
     return taps
 
 
+# `Qwen3Embedder.forward` (`text_encoder.py:383-419`)
 def encode(p: dict[str, Array], cfg: Qwen3_4B, tokens: Tokens) -> Array:
-    """`Qwen3Embedder.forward` (`text_encoder.py:383-419`): `(1,512,7680)` = `[h9 | h18 | h27]`."""
     return jnp.concatenate(trunk(p, cfg, tokens), axis=-1)
