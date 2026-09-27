@@ -50,6 +50,9 @@ class Klein4B:
     # static: it selects a traced kernel, so it must be part of the jit's cache key (D0's
     # lesson — a rebind of the module global was silently ignored). On CPU "flash" falls back.
     attention: Literal["sdpa", "flash"] = "flash"
+    # static for the same reason: "kernel" fuses the head transpose, QK RMSNorm and rope into one
+    # Pallas pass (`kernels.qk_prep`), "xla" keeps the three separate ops. On CPU always "xla".
+    qk_prep: Literal["xla", "kernel"] = "kernel"
 
     @property
     def head_dim(self) -> int:

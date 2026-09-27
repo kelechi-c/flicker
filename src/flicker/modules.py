@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 
 from .config import Qwen3_4B, VAE
+from .kernels import Freqs, qk_prep, row_tile
 from .nn import (
     Attention,
     conv2d,
@@ -85,6 +86,27 @@ def merge_heads(x: Array) -> Array:
     return x.transpose(0, 2, 1, 3).reshape(b, n, h * d)
 
 
+def qkv_prep(
+    qkv: Array,
+    q_scale: Array,
+    k_scale: Array,
+    pe: Array,
+    freqs: Freqs | None,
+    num_heads: int,
+) -> tuple[Array, Array, Array]:
+    """`heads` + `qk_norm` + `apply_rope` on one projection output, as `(q, k, v)`.
+
+    `freqs` non-`None` selects the fused `kernels.qk_prep` pass (TPU only); the XLA chain is kept
+    for CPU and for lengths with no legal row tile, and it is the same arithmetic either way — the
+    kernel's `lane_pair` tables carry the identical two products and the identical sum.
+    """
+    if freqs is not None and row_tile(qkv.shape[1]) is not None:
+        return qk_prep(qkv, q_scale, k_scale, freqs, num_heads)
+    q, k, v = heads(qkv, num_heads)
+    q, k = apply_rope(*qk_norm(q, k, q_scale, k_scale), pe)
+    return q, k, v
+
+
 # --------------------------------------------------------------------------------------
 # double-stream block
 # --------------------------------------------------------------------------------------
@@ -113,28 +135,52 @@ def double_prepare_qkv(
     mod_img: Array,
     mod_txt: Array,
     num_heads: int,
+    freqs: Freqs | None = None,
 ) -> DoubleQKV:
     """Per-stream norm/qkv/QK-norm, then concatenate q/k/v on the **sequence** axis.
 
-    `img` and `txt` stay separate tensors here — only the projected q/k/v are joint.
+    `img` and `txt` stay separate tensors here — only the projected q/k/v are joint. With `freqs`
+    (the fused `kernels.qk_prep` path) the rope table splits at `num_txt` and each stream is
+    rotated on its own: rope is per token, so that is the same rotation, and the `[txt | img]`
+    join then happens once, on already-prepared q/k/v, instead of feeding a joint projection
+    output through the head transpose, the norm and the rope.
     """
     img_mod1, img_mod2 = split_triple(mod_img, 0), split_triple(mod_img, 3)
     txt_mod1, txt_mod2 = split_triple(mod_txt, 0), split_triple(mod_txt, 3)
+    num_txt = txt.shape[1]
 
-    img_q, img_k, img_v = heads(linear(modulate(img, img_mod1), p["img_attn.qkv.weight"]), num_heads)
-    txt_q, txt_k, txt_v = heads(linear(modulate(txt, txt_mod1), p["txt_attn.qkv.weight"]), num_heads)
-    img_q, img_k = qk_norm(img_q, img_k, p["img_attn.norm.query_norm.scale"],
-                           p["img_attn.norm.key_norm.scale"])
-    txt_q, txt_k = qk_norm(txt_q, txt_k, p["txt_attn.norm.query_norm.scale"],
-                           p["txt_attn.norm.key_norm.scale"])
+    if freqs is None:
+        img_q, img_k, img_v = heads(linear(modulate(img, img_mod1), p["img_attn.qkv.weight"]),
+                                    num_heads)
+        txt_q, txt_k, txt_v = heads(linear(modulate(txt, txt_mod1), p["txt_attn.qkv.weight"]),
+                                    num_heads)
+        img_q, img_k = qk_norm(img_q, img_k, p["img_attn.norm.query_norm.scale"],
+                               p["img_attn.norm.key_norm.scale"])
+        txt_q, txt_k = qk_norm(txt_q, txt_k, p["txt_attn.norm.query_norm.scale"],
+                               p["txt_attn.norm.key_norm.scale"])
+        q = jnp.concatenate([txt_q, img_q], axis=2)
+        k = jnp.concatenate([txt_k, img_k], axis=2)
+        v = jnp.concatenate([txt_v, img_v], axis=2)
+        pe_full = jnp.concatenate([pe_ctx, pe], axis=2)
+        q, k = apply_rope(q, k, pe_full)
+        return DoubleQKV(q, k, v, pe_full, num_txt, img_mod1, img_mod2, txt_mod1, txt_mod2)
+
+    cos, sin = freqs
+    txt_q, txt_k, txt_v = qkv_prep(
+        linear(modulate(txt, txt_mod1), p["txt_attn.qkv.weight"]),
+        p["txt_attn.norm.query_norm.scale"], p["txt_attn.norm.key_norm.scale"], pe_ctx,
+        (cos[:num_txt], sin[:num_txt]), num_heads)
+    img_q, img_k, img_v = qkv_prep(
+        linear(modulate(img, img_mod1), p["img_attn.qkv.weight"]),
+        p["img_attn.norm.query_norm.scale"], p["img_attn.norm.key_norm.scale"], pe,
+        (cos[num_txt:], sin[num_txt:]), num_heads)
 
     # [txt | img] on the sequence axis, and the same for the rope tables.
     q = jnp.concatenate([txt_q, img_q], axis=2)
     k = jnp.concatenate([txt_k, img_k], axis=2)
     v = jnp.concatenate([txt_v, img_v], axis=2)
     pe_full = jnp.concatenate([pe_ctx, pe], axis=2)
-    q, k = apply_rope(q, k, pe_full)
-    return DoubleQKV(q, k, v, pe_full, txt.shape[1], img_mod1, img_mod2, txt_mod1, txt_mod2)
+    return DoubleQKV(q, k, v, pe_full, num_txt, img_mod1, img_mod2, txt_mod1, txt_mod2)
 
 
 def double_block(
@@ -147,14 +193,16 @@ def double_block(
     mod_txt: Array,
     num_heads: int,
     attend: Attention = sdpa,
+    freqs: Freqs | None = None,
 ) -> tuple[Array, Array]:
     """`DoubleStreamBlock.forward_kv_extract` with `num_ref_tokens=0` — i.e. plain forward.
 
     One joint attention over `[txt, img]`, split back immediately, then per-stream residuals
-    with per-stream gates and separate output projections/MLPs. `attend` is threaded in from
-    `dit.forward` (the TPU flash kernel there, plain `sdpa` on CPU) — never rebound globally.
+    with per-stream gates and separate output projections/MLPs. `attend` and `freqs` are threaded
+    in from `dit.forward` (the TPU flash and qk-prep kernels there, plain `sdpa`/XLA on CPU) —
+    never rebound globally.
     """
-    state = double_prepare_qkv(p, img, txt, pe, pe_ctx, mod_img, mod_txt, num_heads)
+    state = double_prepare_qkv(p, img, txt, pe, pe_ctx, mod_img, mod_txt, num_heads, freqs)
     attn = merge_heads(attend(state.q, state.k, state.v))
     txt_attn, img_attn = attn[:, : state.num_txt], attn[:, state.num_txt :]
 
@@ -185,7 +233,8 @@ class SingleQKV(NamedTuple):
 
 
 def single_prepare_qkv(
-    p: dict[str, Array], x: Array, mod: Array, num_heads: int, pe: Array
+    p: dict[str, Array], x: Array, mod: Array, num_heads: int, pe: Array,
+    freqs: Freqs | None = None,
 ) -> SingleQKV:
     """`linear1` splits **`[qkv | mlp]`** — qkv first — then rope is applied to q/k only."""
     triple = split_triple(mod, 0)
@@ -194,20 +243,19 @@ def single_prepare_qkv(
         [3 * x.shape[-1]],
         axis=-1,
     )
-    q, k, v = heads(qkv, num_heads)
-    q, k = qk_norm(q, k, p["norm.query_norm.scale"], p["norm.key_norm.scale"])
-    q, k = apply_rope(q, k, pe)
+    q, k, v = qkv_prep(qkv, p["norm.query_norm.scale"], p["norm.key_norm.scale"], pe, freqs, num_heads)
     return SingleQKV(q, k, v, mlp, triple.gate)
 
 
 def single_block(p: dict[str, Array], x: Array, pe: Array, mod: Array, num_heads: int,
-                 attend: Attention = sdpa) -> Array:
+                 attend: Attention = sdpa, freqs: Freqs | None = None) -> Array:
     """`SingleStreamBlock.forward_kv_extract` with `num_ref_tokens=0`.
 
     `linear2(cat([attn | silu_gate(mlp)]))`, residual scaled by the gate. `self.scale` in the
-    reference is dead code and is not ported. `attend` is threaded in from `dit.forward`.
+    reference is dead code and is not ported. `attend` and `freqs` are threaded in from
+    `dit.forward`.
     """
-    state = single_prepare_qkv(p, x, mod, num_heads, pe)
+    state = single_prepare_qkv(p, x, mod, num_heads, pe, freqs)
     attn = merge_heads(attend(state.q, state.k, state.v))
     out = linear(jnp.concatenate([attn, silu_gate(state.mlp)], axis=-1), p["linear2.weight"])
     return x + state.gate * out
