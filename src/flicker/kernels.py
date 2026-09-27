@@ -92,29 +92,29 @@ def qk_prep(
     """One stream's `(B, L, 3*H*D)` projection output -> `q, k, v` `(B, H, L, D)` bf16.
 
     `qkv` is exactly what `nn.linear` produces, `[q | k | v]` on the minor axis in the order
-    `modules.heads` splits it; `freqs` is this stream's `lane_pair` table. Batch 1 only (the DiT's
-    serving shape). `rows` overrides the tile (the bench sweeps it); `interpret` runs on CPU.
+    `modules.heads` splits it; `freqs` is this stream's `lane_pair` table (shared across the batch).
+    `rows` overrides the tile (the bench sweeps it); `interpret` runs on CPU.
     """
     import jax.experimental.pallas as pl
 
     batch, length, width = qkv.shape
     head_dim = width // (3 * num_heads)
     tile_rows = rows or row_tile(length)
-    if batch != 1 or tile_rows is None or length % tile_rows:
-        raise ValueError(f"qk_prep needs batch 1 and a row tile dividing L={length} (rows={tile_rows})")
+    if tile_rows is None or length % tile_rows:
+        raise ValueError(f"qk_prep needs a row tile dividing L={length} (rows={tile_rows})")
     cos, sin = freqs
 
     def column(offset: int) -> "pl.BlockSpec":
         """Head `h`'s 128-wide slice of the q (offset 0), k (H) or v (2H) columns."""
-        return pl.BlockSpec((1, tile_rows, head_dim), lambda i, h: (0, i, offset + h))
+        return pl.BlockSpec((1, tile_rows, head_dim), lambda b, i, h: (b, i, offset + h))
 
-    table = pl.BlockSpec((tile_rows, head_dim), lambda i, h: (i, 0))
-    scale = pl.BlockSpec((1, head_dim), lambda i, h: (0, 0))
-    out = pl.BlockSpec((1, 1, tile_rows, head_dim), lambda i, h: (0, h, i, 0))
+    table = pl.BlockSpec((tile_rows, head_dim), lambda b, i, h: (i, 0))
+    scale = pl.BlockSpec((1, head_dim), lambda b, i, h: (0, 0))
+    out = pl.BlockSpec((1, 1, tile_rows, head_dim), lambda b, i, h: (b, h, i, 0))
     kernel = pl.pallas_call(
         _body,
         out_shape=[jax.ShapeDtypeStruct((batch, num_heads, length, head_dim), qkv.dtype)] * 3,
-        grid=(length // tile_rows, num_heads),
+        grid=(batch, length // tile_rows, num_heads),
         in_specs=[column(0), column(num_heads), column(2 * num_heads), table, table, scale, scale],
         out_specs=[out] * 3,
         interpret=interpret,
