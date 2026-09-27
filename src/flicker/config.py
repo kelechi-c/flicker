@@ -53,6 +53,12 @@ class Klein4B:
     # static for the same reason: "kernel" fuses the head transpose, QK RMSNorm and rope into one
     # Pallas pass (`kernels.qk_prep`), "xla" keeps the three separate ops. On CPU always "xla".
     qk_prep: Literal["xla", "kernel"] = "kernel"
+    # static like `attention`/`qk_prep`: it names which block GEMMs run the SmoothQuant int8 path,
+    # so it is part of the jit's cache key. "bf16" is production. "smooth_large" quantizes exactly
+    # the two block GEMMs D4 measured a speedup on (double `img_mlp.0`, single `linear1`); it needs
+    # activation statistics, so the leaves are built by `loader.fold_smooth`, not by `load_dit`
+    # (which refuses a non-bf16 `gemm` rather than silently hand back a bf16 tree).
+    gemm: Literal["bf16", "smooth_large"] = "bf16"
 
     @property
     def head_dim(self) -> int:
