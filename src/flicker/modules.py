@@ -165,15 +165,14 @@ def double_prepare_qkv(
         q, k = apply_rope(q, k, pe_full)
         return DoubleQKV(q, k, v, pe_full, num_txt, img_mod1, img_mod2, txt_mod1, txt_mod2)
 
-    cos, sin = freqs
     txt_q, txt_k, txt_v = qkv_prep(
         linear(modulate(txt, txt_mod1), p["txt_attn.qkv.weight"]),
         p["txt_attn.norm.query_norm.scale"], p["txt_attn.norm.key_norm.scale"], pe_ctx,
-        (cos[:num_txt], sin[:num_txt]), num_heads)
+        Freqs(freqs.cos[:num_txt], freqs.sin[:num_txt], freqs.q_gain), num_heads)
     img_q, img_k, img_v = qkv_prep(
         linear(modulate(img, img_mod1), p["img_attn.qkv.weight"]),
         p["img_attn.norm.query_norm.scale"], p["img_attn.norm.key_norm.scale"], pe,
-        (cos[num_txt:], sin[num_txt:]), num_heads)
+        Freqs(freqs.cos[num_txt:], freqs.sin[num_txt:], freqs.q_gain), num_heads)
 
     # [txt | img] on the sequence axis, and the same for the rope tables.
     q = jnp.concatenate([txt_q, img_q], axis=2)

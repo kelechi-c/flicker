@@ -1,8 +1,11 @@
+import math
+
 import jax
 import jax.numpy as jnp
 from jax import lax
 
 from .config import Klein4B
+from .kernels import attend as bounded_attend
 from .kernels import lane_pair
 from .modules import double_block, last_layer, mlp_embedder, modulation, single_block
 from .nn import flash_sdpa, linear, sdpa, timestep_embedding
@@ -34,7 +37,12 @@ def forward(
     step** here, outside the 25-block scan, and threaded down as `freqs`.
     """
     on_tpu = jax.default_backend() == "tpu"
-    attend = flash_sdpa if cfg.attention == "flash" and on_tpu else sdpa
+    # "bounded" needs q pre-scaled by the qk-prep kernel and a 128-multiple in both streams;
+    # anything else keeps the library flash kernel, so the choice is made once, here.
+    bounded = (cfg.attention == "bounded" and cfg.qk_prep == "kernel" and on_tpu
+               and x.shape[1] % 128 == 0 and ctx.shape[1] % 128 == 0)
+    attend = bounded_attend if bounded else flash_sdpa if cfg.attention != "sdpa" and on_tpu else sdpa
+    q_gain = 1.0 / math.sqrt(cfg.head_dim) if bounded else 1.0
     vec = mlp_embedder(p["time_in"], timestep_embedding(t, 256))
     mod_img = modulation(p["double_stream_modulation_img"], vec, double=True)
     mod_txt = modulation(p["double_stream_modulation_txt"], vec, double=True)
@@ -45,7 +53,7 @@ def forward(
     pe_x = embed_nd(x_ids, cfg.axes_dim, cfg.theta)
     pe_ctx = embed_nd(ctx_ids, cfg.axes_dim, cfg.theta)
     pe = jnp.concatenate([pe_ctx, pe_x], axis=2)
-    freqs = lane_pair(pe) if cfg.qk_prep == "kernel" and on_tpu else None
+    freqs = lane_pair(pe, q_gain) if cfg.qk_prep == "kernel" and on_tpu else None
 
     def one_double(carry: tuple[Array, Array], block: dict[str, Array]) -> tuple[Array, Array]:
         img, txt = carry
