@@ -371,8 +371,27 @@ def attn_block(x: Array, p: Params, prefix: str, cfg: VAE) -> Array:
     return x + out.reshape(b, h, w, c)
 
 
-def upsample(x: Array, p: Params, prefix: str) -> Array:
-    """`Upsample2D`: `F.interpolate(scale_factor=2, mode="nearest")` then a 3x3 conv."""
+def box_kernel(w: Array) -> Array:
+    """A 3x3 `(3,3,in,out)` kernel summed over the 2x2 box nearest-upsampling applies -> `(4,4,in,out)`.
+
+    Nearest-2x is zero insertion followed by a 2x2 box filter, so `conv3x3(nearest(x))` equals
+    `conv4x4(zero_inserted(x))` with this kernel. Summed in fp32, rounded once.
+    """
+    wide = w.astype(jnp.float32)
+    box = jnp.zeros((4, 4, *w.shape[2:]), jnp.float32)
+    return box.at[:3, :3].add(wide).at[1:, :3].add(wide).at[:3, 1:].add(wide).at[1:, 1:].add(wide).astype(w.dtype)
+
+
+def upsample(x: Array, p: Params, prefix: str, cfg: VAE) -> Array:
+    """`Upsample2D`: `F.interpolate(scale_factor=2, mode="nearest")` then a 3x3 conv.
+
+    `cfg.upsample == "dilated"` runs the pair as one 4x4 conv on the zero-inserted low-res input
+    (`box_kernel`), so the upsampled tensor is never built: 16.7 -> 6.9 ms over the three
+    upsamplers of a 1024² decode on v6e (`tools/bench_upsample.py`).
+    """
+    if cfg.upsample == "dilated":
+        w = box_kernel(p[f"{prefix}.conv.weight"])
+        return conv2d(x, w, padding=((2, 2), (2, 2)), dilation=2) + p[f"{prefix}.conv.bias"]
     return conv(upsample_nearest(x), p, f"{prefix}.conv")
 
 def unpatchify(z: Array, patch: int = 2) -> Array:

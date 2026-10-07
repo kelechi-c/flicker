@@ -98,6 +98,8 @@ class VAE:
     bn_eps: float = 1e-4
     groups: int = 32
     norm_eps: float = 1e-6
+    # static: "dilated" runs nearest-2x + 3x3 as one 4x4 conv on the zero-inserted input.
+    upsample: Literal["nearest", "dilated"] = "nearest"
 
 
 def timesteps(num_steps: int, seq_len: int) -> tuple[float, ...]:

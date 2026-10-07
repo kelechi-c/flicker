@@ -143,7 +143,7 @@ def decoder_forward(p: Params, x: Array, cfg: VAE, trace: dict[str, Array] | Non
         for j in range(cfg.num_res_blocks + 1):
             h = resnet_block(h, up, f"{i}.resnets.{j}", cfg)
         if i < len(cfg.ch_mult) - 1:
-            h = upsample(h, up, f"{i}.upsamplers.0")
+            h = upsample(h, up, f"{i}.upsamplers.0", cfg)
         _put(trace, f"dec/up/{i}", _nchw(h))
     h = conv(jax.nn.silu(gn(h, d, "conv_norm_out", cfg)), d, "conv_out")
     _put(trace, "dec/out", _nchw(h))

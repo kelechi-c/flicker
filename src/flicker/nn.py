@@ -14,7 +14,7 @@ import jax.numpy as jnp
 from jax import lax
 
 Array = jax.Array
-Padding = str
+Padding = str | tuple[tuple[int, int], tuple[int, int]]
 Attention = Callable[[Array, Array, Array], Array]
 
 # int8 is symmetric, so 127 (not 128) is the positive ceiling and -127 the negative one: values
@@ -189,13 +189,17 @@ def tile(length: int, sizes: tuple[int, ...]) -> int:
     return next(size for size in sizes if length % size == 0)
 
 
-def conv2d(x: Array, w: Array, stride: int = 1, padding: Padding = "SAME") -> Array:
-    """NCHW->NHWC conv. `w` is HWIO. fp32 accumulation (cudnn's behaviour for bf16)."""
+def conv2d(x: Array, w: Array, stride: int = 1, padding: Padding = "SAME", dilation: int = 1) -> Array:
+    """NCHW->NHWC conv. `w` is HWIO. fp32 accumulation (cudnn's behaviour for bf16).
+
+    `dilation` is the **input** dilation: `dilation - 1` zeros between input pixels.
+    """
     out = lax.conv_general_dilated(
         x,
         w,
         (stride, stride),
-        padding.upper(),
+        padding.upper() if isinstance(padding, str) else padding,
+        lhs_dilation=(dilation, dilation),
         dimension_numbers=("NHWC", "HWIO", "NHWC"),
         preferred_element_type=jnp.float32,
     )
