@@ -138,7 +138,9 @@ def qk_prep(
 
 
 # Score tiles for `attend`, largest first; q and k use the same one. 2304 x 2304 fp32 scores are
-# 21 MB of the 32 MB vmem, and the v6e sweep (`tools/bench_flash.py`) ranks it first at L=4608.
+# 21 MB, under the compiler's default 32 MB scoped-vmem limit per kernel (a budget, not the chip's
+# vmem; `vmem_limit_bytes` raises it), and the v6e sweep (`tools/bench_flash.py`) ranks it first
+# at L=4608.
 # every entry is a multiple of 128, the lane width the kernel's tiles need.
 SCORE_TILES = (2304, 1536, 1152, 512, 256, 128)
 # fp32 `exp` overflows at 88.7; `attend` is only legal below this.
