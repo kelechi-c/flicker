@@ -47,11 +47,12 @@ class Klein4B:
     theta: int = 2000
     mlp_ratio: float = 3.0
     use_guidance_embed: bool = False
-    # static: it selects a traced kernel, so it must be part of the jit's cache key (D0's
-    # lesson — a rebind of the module global was silently ignored). On CPU "flash" falls back.
-    # "bounded" is `kernels.attend`: flash minus the running max, valid while
-    # `kernels.logit_bound` of every block stays under `kernels.EXP_LIMIT`.
-    attention: Literal["sdpa", "flash", "bounded"] = "flash"
+    # static: it selects a traced kernel, so it must be part of the jit's cache key (a rebind of
+    # a module global is silently ignored by the trace cache). "bounded" is `kernels.attend`:
+    # flash minus the running max, valid while `kernels.logit_bound` of every block stays under
+    # `kernels.EXP_LIMIT` (`loader.load_dit` checks). "flash" is the library kernel; both fall
+    # back to "sdpa" off TPU.
+    attention: Literal["sdpa", "flash", "bounded"] = "bounded"
     # static for the same reason: "kernel" fuses the head transpose, QK RMSNorm and rope into one
     # Pallas pass (`kernels.qk_prep`), "xla" keeps the three separate ops. On CPU always "xla".
     qk_prep: Literal["xla", "kernel"] = "kernel"
@@ -98,8 +99,9 @@ class VAE:
     bn_eps: float = 1e-4
     groups: int = 32
     norm_eps: float = 1e-6
-    # static: "dilated" runs nearest-2x + 3x3 as one 4x4 conv on the zero-inserted input.
-    upsample: Literal["nearest", "dilated"] = "nearest"
+    # static: "dilated" runs nearest-2x + 3x3 as one 4x4 conv on the zero-inserted input (the
+    # default: 37.4 -> 26.1 ms per 1024² decode on v6e); "nearest" is the reference's literal form.
+    upsample: Literal["nearest", "dilated"] = "dilated"
 
 
 def timesteps(num_steps: int, seq_len: int) -> tuple[float, ...]:

@@ -30,6 +30,7 @@ import numpy as np
 from safetensors import safe_open
 
 from .config import Klein4B, Qwen3_4B
+from .kernels import EXP_LIMIT, logit_bound
 from .nn import Int8Weight, quantize_weight_smooth, smooth_scales
 
 Array = jax.Array
@@ -158,8 +159,31 @@ def load_dit(path: str, cfg: Klein4B) -> Tree:
         "double_blocks": stack_blocks(flat, "double_blocks", cfg.depth),
         "single_blocks": stack_blocks(flat, "single_blocks", cfg.depth_single_blocks),
     }
+    if cfg.attention == "bounded":
+        check_logit_bound(blocks)
     top = {k: v for k, v in flat.items() if not k.startswith(("double_blocks.", "single_blocks."))}
     return jax.device_put(nest(top) | blocks)
+
+
+def check_logit_bound(blocks: Tree) -> None:
+    """Refuse `attention="bounded"` for weights whose QK-norm scales allow `exp` to overflow.
+
+    The double blocks attend over `[txt | img]` jointly, so their bound takes the larger scale of
+    the two streams on each side.
+    """
+    double, single = blocks["double_blocks"], blocks["single_blocks"]
+
+    def joint(name: str) -> np.ndarray:
+        return np.maximum(*(np.abs(np.asarray(double[f"{s}_attn.norm.{name}.scale"], np.float32))
+                            for s in ("img", "txt")))
+
+    bounds = (logit_bound(joint("query_norm"), joint("key_norm")),
+              logit_bound(*(np.asarray(single[f"norm.{n}.scale"], np.float32)
+                            for n in ("query_norm", "key_norm"))))
+    worst = max(float(np.max(np.asarray(b))) for b in bounds)
+    if worst >= EXP_LIMIT:
+        raise ValueError(f"attention='bounded' needs logits under {EXP_LIMIT}; these weights allow "
+                         f"{worst:.1f}. use attention='flash'")
 
 
 def fold_smooth(tree: Tree, mode: str, absmax: dict[str, Array], alpha: float) -> Tree:
