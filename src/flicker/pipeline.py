@@ -6,7 +6,7 @@ request peaks at about 21.5 GB on device with all of them loaded — over a 16 G
 """
 
 import dataclasses
-from typing import Sequence
+from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp

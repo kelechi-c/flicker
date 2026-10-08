@@ -18,8 +18,7 @@ VAE_SUBDIR = "vae"
 
 # the chat template renders to exactly this when enable_thinking=False. byte-exact: the think
 # tags are plain ascii text, **not** special tokens (the `<|im_start|>` family are).
-# nb: `docs/handoff.md` §4 shows this string with the angle brackets eaten by html rendering —
-# the rendered truth is `<think>` / `</think>`, asserted against `apply_chat_template` in Stage A.
+# the rendered truth is `<think>` / `</think>`, as `apply_chat_template` produces it.
 CHAT_TEMPLATE = (
     "<|im_start|>user\n{prompt}<|im_end|>\n"
     "<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -56,12 +55,6 @@ class Klein4B:
     # static for the same reason: "kernel" fuses the head transpose, QK RMSNorm and rope into one
     # Pallas pass (`kernels.qk_prep`), "xla" keeps the three separate ops. On CPU always "xla".
     qk_prep: Literal["xla", "kernel"] = "kernel"
-    # static like `attention`/`qk_prep`: it names which block GEMMs run the SmoothQuant int8 path,
-    # so it is part of the jit's cache key. "bf16" is production. "smooth_large" quantizes exactly
-    # the two block GEMMs D4 measured a speedup on (double `img_mlp.0`, single `linear1`); it needs
-    # activation statistics, so the leaves are built by `loader.fold_smooth`, not by `load_dit`
-    # (which refuses a non-bf16 `gemm` rather than silently hand back a bf16 tree).
-    gemm: Literal["bf16", "smooth_large"] = "bf16"
 
     @property
     def head_dim(self) -> int:

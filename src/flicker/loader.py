@@ -1,6 +1,6 @@
 """safetensors -> nested pytree, one tensor at a time.
 
-Three rules and no renaming table (`port-plan` §4):
+Three rules and no renaming table:
 
 | torch | jax |
 |---|---|
@@ -12,11 +12,7 @@ The tree nests **one** level at the module the consuming function takes as an ar
 the rest of the torch path dotted: `p["time_in"]["in_layer.weight"]`,
 `p["double_blocks"]["img_attn.qkv.weight"]` (leading axis = block index, ready for `lax.scan`).
 The key set is asserted in **both** directions — a missing key and an unexpected key are both
-hard errors, because a `ShapeDtypeStruct`-template loader silently no-ops otherwise (§9.1).
-
-One optional post-load rewrite: `fold_smooth` replaces the block GEMMs a SmoothQuant mode names
-with `nn.Int8Weight` leaves (calibrated off-TPU), and `save_calibration`/`load_calibration` move
-the statistics it folds against. The checkpoint's names stay the contract.
+hard errors, because a `ShapeDtypeStruct`-template loader silently no-ops otherwise.
 """
 
 import functools
@@ -31,7 +27,6 @@ from safetensors import safe_open
 
 from .config import Klein4B, Qwen3_4B
 from .kernels import EXP_LIMIT, logit_bound
-from .nn import Int8Weight, quantize_weight_smooth, smooth_scales
 
 Array = jax.Array
 Tree = dict[str, Array]
@@ -48,7 +43,7 @@ open_np = functools.partial(
 def header(path: str) -> dict[str, tuple[str, tuple[int, ...]]]:
     """`{key: (dtype, shape)}` without reading any tensor data."""
     with safe_open(path, framework="np") as f:
-        return {k: (str(f.get_slice(k).get_dtype()), tuple(f.get_slice(k).get_shape())) for k in f.keys()}
+        return {k: (str(f.get_slice(k).get_dtype()), tuple(f.get_slice(k).get_shape())) for k in f.keys()}  # noqa: SIM118 (not iterable)
 
 
 def load_flat(path: str, expected: set[str], transpose: tuple[str, ...] = ("weight",),
@@ -99,7 +94,7 @@ def stack_blocks(flat: Tree, prefix: str, count: int) -> Tree:
 
 
 def dit_keys(cfg: Klein4B) -> set[str]:
-    """The 149 tensor names of `flux-2-klein-4b.safetensors` (project.md §7 closes exactly)."""
+    """The 149 tensor names of `flux-2-klein-4b.safetensors`."""
     keys = {
         "img_in.weight",
         "txt_in.weight",
@@ -131,29 +126,8 @@ def dit_keys(cfg: Klein4B) -> set[str]:
     return keys
 
 
-# Which block GEMMs each `Klein4B.gemm` mode quantizes, as the *stacked* leaf keys. "smooth_large"
-# is the two GEMMs D4 measured a real speedup on: the single-stream `linear1` (unsplit — D4 showed
-# the load-time split gains nothing) and the double-stream `img_mlp.0`. Embedders, modulations,
-# attention projections and the final layer are never named, so they stay bf16 in every mode.
-INT8_MODES: dict[str, dict[str, tuple[str, ...]]] = {
-    "bf16": {},
-    "smooth_large": {"double_blocks": ("img_mlp.0.weight",), "single_blocks": ("linear1.weight",)},
-}
-# Modes that need a calibration pass: they cannot be built from the checkpoint alone, so `load_dit`
-# refuses them loudly instead of quietly handing back a bf16 tree (the D0 silent no-op).
-SMOOTH_MODES = ("smooth_large",)
-
-
 def load_dit(path: str, cfg: Klein4B) -> Tree:
-    """Stream the DiT checkpoint into the scan-ready pytree of device arrays.
-
-    A non-bf16 `cfg.gemm` raises: those leaves need activation statistics, so they are built by
-    `fold_smooth` on the tree this returns loaded with `gemm="bf16"`. Without the refusal a
-    mis-wired arm would silently measure bf16 twice.
-    """
-    if cfg.gemm != "bf16":
-        raise ValueError(f"gemm={cfg.gemm!r} needs activation statistics; load with gemm='bf16' and "
-                         f"fold with fold_smooth")
+    """Stream the DiT checkpoint into the scan-ready pytree of device arrays."""
     flat = load_flat(path, dit_keys(cfg))
     blocks = {
         "double_blocks": stack_blocks(flat, "double_blocks", cfg.depth),
@@ -184,71 +158,6 @@ def check_logit_bound(blocks: Tree) -> None:
     if worst >= EXP_LIMIT:
         raise ValueError(f"attention='bounded' needs logits under {EXP_LIMIT}; these weights allow "
                          f"{worst:.1f}. use attention='flash'")
-
-
-def fold_smooth(tree: Tree, mode: str, absmax: dict[str, Array], alpha: float) -> Tree:
-    """SmoothQuant: replace every leaf `mode` names by its `diag(s)`-folded `Int8Weight`. Pure.
-
-    `absmax[f"{stack}.{key}"]` is the calibration's per-input-channel activation absmax for that
-    leaf, shape `(depth, in)` — one entry per **block**, which is what makes the fold per-block
-    rather than per-GEMM-name. The weight's own per-input-channel absmax is read off the leaf, and
-    `nn.smooth_scales` combines the two. The dense tree is untouched, so one load serves every
-    alpha and mode and a candidate costs one fold (~half the quantized leaves' bytes).
-    """
-    if mode not in SMOOTH_MODES:
-        raise ValueError(f"{mode!r} is not a smooth mode; expected one of {SMOOTH_MODES}")
-    out: Tree = {}
-    for stack, keys in INT8_MODES[mode].items():
-        if stack not in tree:
-            continue
-        block: Tree = {}
-        for key, value in tree[stack].items():
-            if key not in keys:
-                block[key] = value
-                continue
-            channel = absmax.get(f"{stack}.{key}")
-            if channel is None:
-                raise KeyError(f"no calibration absmax for {stack}.{key}")
-            block[key] = _fold_per_block(value, channel, alpha)
-        out[stack] = block
-    return tree | out
-
-
-def _fold_per_block(value: Array, channel: Array, alpha: float) -> Int8Weight:
-    """`quantize_weight_smooth` one block at a time, then re-stacked.
-
-    The stacked fp32 upcast of `single_blocks.linear1` alone is 6.3 GiB — it OOM'd the D5 session
-    with the dense model resident. Folding per block caps the fp32 working set at one layer
-    (~340 MB) and gives the same leaf.
-    """
-    parts = [quantize_weight_smooth(
-                 value[i], smooth_scales(channel[i], jnp.max(jnp.abs(value[i].astype(jnp.float32)),
-                                                             axis=-1), alpha))
-             for i in range(value.shape[0])]
-    return Int8Weight(*(jnp.stack(leaves) for leaves in zip(*parts)))
-
-
-def save_calibration(path: str, absmax: dict[str, Array]) -> None:
-    """Write a calibration's taps to one safetensors file: keys `"{stack}.{leaf}"`, `(depth, in)`.
-
-    Fail-closed on the shape contract: `fold_smooth` looks the taps up by leaf name and folds per
-    block, so a wrong leading axis would fold the wrong block's statistics into a leaf — legal
-    arithmetic and silently meaningless. The key set is therefore checked here, exactly like the
-    checkpoint's.
-    """
-    from safetensors.numpy import save_file
-
-    checks = {f"{stack}.{key}" for stack, keys in INT8_MODES["smooth_large"].items() for key in keys}
-    if set(absmax) != checks:
-        raise ValueError(f"calibration keys are not the smooth_large leaf set: {sorted(absmax)}")
-    save_file({key: np.asarray(value, np.float32) for key, value in sorted(absmax.items())}, path)
-
-
-def load_calibration(path: str) -> dict[str, Array]:
-    """Read a calibration safetensors back into `{stack.leaf: (depth, in)}` fp32 arrays."""
-    from safetensors.numpy import load_file
-
-    return {key: jnp.asarray(value) for key, value in load_file(path).items()}
 
 
 EMBED_KEY = "model.embed_tokens.weight"

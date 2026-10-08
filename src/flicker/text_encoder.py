@@ -3,16 +3,24 @@
 
 import functools
 import json
-from typing import NamedTuple, Sequence
+from collections.abc import Sequence
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax import lax
 from huggingface_hub import hf_hub_download
+from jax import lax
 from tokenizers import Tokenizer
 
-from .config import CHAT_TEMPLATE, MAX_LENGTH, REPO, TAP_LAYERS, TOKENIZER_SUBDIR, Qwen3_4B
+from .config import (
+    CHAT_TEMPLATE,
+    MAX_LENGTH,
+    REPO,
+    TAP_LAYERS,
+    TOKENIZER_SUBDIR,
+    Qwen3_4B,
+)
 from .modules import qwen3_layer
 
 Array = jax.Array
@@ -31,7 +39,8 @@ def load_tokenizer(revision: str | None = None) -> tuple[Tokenizer, int]:
     kwargs = {"revision": rev} if rev else {}
     cfg_file = hf_hub_download(REPO, f"{TOKENIZER_SUBDIR}/tokenizer_config.json", **kwargs)
     tok_file = hf_hub_download(REPO, f"{TOKENIZER_SUBDIR}/tokenizer.json", **kwargs)
-    config = json.loads(open(cfg_file).read())
+    with open(cfg_file) as file:
+        config = json.load(file)
     tokenizer = Tokenizer.from_file(tok_file)
     # `pad_token_id` is not in the config: it stores the *string*, and the id lives in the vocab.
     return tokenizer, int(tokenizer.token_to_id(config["pad_token"]))

@@ -12,7 +12,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from .config import Qwen3_4B, VAE
+from .config import VAE, Qwen3_4B
 from .kernels import Freqs, qk_prep, row_tile
 from .nn import (
     Attention,
