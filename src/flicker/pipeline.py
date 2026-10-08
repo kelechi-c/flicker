@@ -1,7 +1,8 @@
 """Text -> image, in three separable stages so a 16 GB chip can hold them one at a time.
 
 Each function loads only the weights it needs, which is what makes the 1-chip TPU path (and a
-24 GB L4) work: DiT 7.2 GiB + Qwen 8 GiB + VAE 0.2 GiB do **not** fit together (port-plan §7.3).
+24 GB L4) work: DiT 7.75 GB + Qwen3 5.45 GB + VAE 0.1 GB is 13.3 GB of weights, and a 1024²
+request peaks at about 21.5 GB on device with all of them loaded — over a 16 GiB chip.
 """
 
 import dataclasses
@@ -56,7 +57,7 @@ def denoise_from(
     """Noise -> final latent `(B,L,128)`, four Euler steps in one scanned `jit`.
 
     `noise` injects a captured draw `(B,128,h,w)` — the parity path, where reproducing torch's
-    CUDA RNG is infeasible (project.md §8.2 item 8) — otherwise `key` draws one in JAX.
+    CUDA RNG is infeasible — otherwise `key` draws one in JAX.
     When `return_trajectory=True`, returns `(final_latent, trajectory)` where `trajectory`
     has shape `(T,B,L,128)` packed bf16 post-Euler carries.
     """
@@ -81,11 +82,10 @@ def decode_from(vae_params: dict, cfg: Config, latent: jax.Array, height: int, w
     return _vae_decode(vae_params, z, cfg.vae)
 
 
-# The three stage loaders. On 16 GiB (v5e-1) the components do **not** co-reside — DiT 7.75 GB +
-# Qwen3 5.45 GB + VAE 0.1 GB — so the staged functions below load, run, and drop. On 32 GiB
-# (v6e-1) `load_all`/`generate_resident` keep everything alive and take weight staging out of the
-# latency path entirely, which matters because staging measured 37x the compute on an L4
-# (`docs/roofline.md` §7).
+# The three stage loaders. On 16 GiB (v5e-1) the components do **not** co-reside — 13.3 GB of
+# weights, ~21.5 GB peak with activations — so the staged functions below load, run, and drop. On 32 GiB
+# (v6e-1) `load_all`/`generate_resident` keep everything alive, so weight transfers happen once at
+# startup and never sit on the request path.
 
 
 def text_ctx(paths: Paths, cfg: Config, prompt: str) -> jax.Array:
@@ -109,7 +109,7 @@ def decode(paths: Paths, cfg: Config, latent: jax.Array, height: int, width: int
 
 
 def to_uint8(image: np.ndarray) -> np.ndarray:
-    """`(127.5 * (x + 1)).byte()` — clamp then **truncate**, not round (project.md §8.2)."""
+    """`(127.5 * (x + 1)).byte()` — clamp then **truncate**, not round."""
     clipped = np.clip(np.asarray(image, np.float32), -1.0, 1.0)
     arr = np.clip(127.5 * (clipped + 1.0), 0, 255).astype(np.uint8)
     if arr.ndim == 4 and arr.shape[0] == 1:

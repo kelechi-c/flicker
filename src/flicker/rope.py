@@ -1,6 +1,6 @@
 """4-axis rope, the position-id conventions, and latent packing.
 
-The single subtlest part of the port (`project.md` §3.4). Three things must all be right:
+The single subtlest part of the port. Three things must all be right:
 interleaved **adjacent-pair** rotation (not Llama's half-split), pairs `0-15=t, 16-31=h, 32-47=w,
 48-63=l`, and fp32-in / bf16-out.
 """

@@ -333,7 +333,7 @@ def conv(x: Array, p: Params, name: str, padding: str = "SAME") -> Array:
 
     Torch adds the bias inside the fp32 accumulation; `nn.conv2d` rounds to bf16 first, so this
     costs one extra bf16 rounding per conv. That and the GroupNorm round-trips are why the decoder
-    measures 40-48 dB (`tests/test_vae.py`) rather than bit-exact.
+    measures 40-48 dB rather than bit-exact.
     """
     return conv2d(x, p[f"{name}.weight"], padding=padding) + p[f"{name}.bias"]
 
@@ -396,7 +396,7 @@ def upsample(x: Array, p: Params, prefix: str, cfg: VAE) -> Array:
 
 def unpatchify(z: Array, patch: int = 2) -> Array:
     """`Flux2KleinPipeline._unpatchify_latents`: packed channel `c*patch^2 + pi*patch + pj` lands at
-    pixel `(2*i + pi, 2*j + pj)` — **channel-major**, verified in `tests/test_vae.py`."""
+    pixel `(2*i + pi, 2*j + pj)` — **channel-major**."""
     b, c, h, w = z.shape
     x = z.reshape(b, c // patch**2, patch, patch, h, w).transpose(0, 1, 4, 2, 5, 3)
     return x.reshape(b, c // patch**2, h * patch, w * patch)

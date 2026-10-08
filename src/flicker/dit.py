@@ -31,7 +31,7 @@ def forward(
     """One t2i velocity prediction. `cfg.attention` picks the attention kernel: the Pallas flash
     kernel on TPU, plain `sdpa` everywhere else (so CPU tests never need Pallas). Resolved once,
     here, and threaded into every block — a rebind of the module global is silently ignored by
-    jit's trace cache (D0), and `cfg` is a static argument, so each choice is its own cache entry.
+    jit's trace cache, and `cfg` is a static argument, so each choice is its own cache entry.
     `cfg.qk_prep` picks the q/k/v prep the same way: `kernels.qk_prep` on TPU, the XLA chain
     (`heads` + `qk_norm` + `apply_rope`) off it. The kernel's rope tables are derived **once per
     step** here, outside the 25-block scan, and threaded down as `freqs`.

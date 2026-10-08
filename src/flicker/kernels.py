@@ -1,10 +1,9 @@
-"""Fused Pallas qk-prep for the DiT attention chain (D3c).
+"""Fused Pallas qk-prep for the DiT attention chain.
 
 The chain between the q/k/v projection GEMMs and flash attention — the `heads()`
 `(B,L,3,H,D) -> (3,B,H,L,D)` transpose, `qk_norm` (a per-head RMSNorm over `D`, fp32 compute ->
 bf16 cast -> bf16 scale) and `apply_rope` (fp32 adjacent-pair rotation -> bf16) — costs
-~114-128 ms per 4-step scan at 1024² in separate HBM round trips against a ~10-20 ms byte floor
-(`out/tpu/d3b/op-profile.json`). This kernel does all three in one pass: the projection output is
+~114-128 ms per 4-step scan at 1024² in separate HBM round trips against a ~10-20 ms byte floor. This kernel does all three in one pass: the projection output is
 read once, q/k/v are written once, and the head transpose is folded into the output index map.
 
 Mosaic shape rules (the first version failed to lower: strided lane slices became a gather, and
@@ -19,8 +18,7 @@ it reshaped/transposed tiles in registers). This version only ever touches 2-D `
 The arithmetic is the shipped chain's, cast point for cast point: `fp32 mean of squares + eps ->
 rsqrt -> multiply -> cast bf16 -> times the bf16 QKNorm scale`, then `fp32 -> cos*x + sin*pair_swap
 -> cast bf16`. `lane_pair` derives the `(L, 128)` lanes this kernel wants from today's
-`(1,1,L,64,2,2)` table; the two products and their sum are the same, so the result is the same
-(`docs/optimization-notes.md`, 2026-09-26 D2/D3 bit-identity).
+`(1,1,L,64,2,2)` table; the two products and their sum are the same, so the result is the same.
 
 Pallas is imported inside `qk_prep` so a CPU import of this module stays free, as `nn.flash_sdpa`
 does. `row_tile` returning `None` means no legal tile exists and the caller keeps the XLA chain.
@@ -177,7 +175,7 @@ def attend(q: Array, k: Array, v: Array, *, block: int | None = None, interpret:
 
     The grid is (batch, head, q tile, k tile); the k axis is the accumulation, held in vmem scratch
     and written out on its last step. Measured on v6e-1 at L=4608: 0.69 ms per call against the
-    library flash kernel's 1.02 ms (`out/tpu/flash/`).
+    library flash kernel's 1.02 ms.
     """
     import jax.experimental.pallas as pl
     from jax.experimental.pallas import tpu as pltpu

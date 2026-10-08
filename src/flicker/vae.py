@@ -3,17 +3,16 @@
 The i2i **encoder** path is out of scope; `load_vae` streams only `decoder.*`, `post_quant_conv` and
 the two batch-norm stats (142 of the file's 251 tensors).
 
-Decode chain, exactly as `tools/stage_b_vae.py` captures it (quoted in `tests/golden/vae.json`):
+Decode chain:
 
     z (B,128,h,w)  --bn inversion-->  z_in  --unpatchify-->  (B,32,2h,2w)  --post_quant_conv-->
     decoder: conv_in -> mid_block -> up_blocks[0..3] -> conv_norm_out -> silu -> conv_out
 
 The batch-norm inversion is **not** in `AutoencoderKLFlux2.decode` — `Flux2KleinPipeline.__call__`
-applies it to the packed latent first, in **bf16**, `sqrt(var + eps)` included. That contradicts
-`docs/port-plan.md` decision #5 ("compute it in fp32"); the oracle wins, and the two differ by
-3.9e-3 relative on `z_in`. See `inv_normalize`.
+applies it to the packed latent first, in **bf16**, `sqrt(var + eps)` included. The port follows
+that: computing the sqrt in fp32 would move `z_in` by 3.9e-3 relative. See `inv_normalize`.
 
-Layout: NCHW at the public boundary (the fixture contract is NCHW), NHWC inside, because
+Layout: NCHW at the public boundary, NHWC inside, because
 `nn.conv2d` is an NHWC `lax.conv_general_dilated`.
 """
 
@@ -60,7 +59,7 @@ def _attn_keys() -> set[str]:
 
 
 def vae_keys(cfg: VAE) -> set[str]:
-    """The 142 decoder-path names of `vae/diffusion_pytorch_model.safetensors` (`project.md` §5).
+    """The 142 decoder-path names of `vae/diffusion_pytorch_model.safetensors`.
 
     Up-level widths run backwards over `ch_mult` (`block_out_channels[-1]` first), and a level's
     first resnet carries the 1x1 `conv_shortcut` exactly when the level changes width.
@@ -95,7 +94,7 @@ def load_vae(path: str, cfg: VAE) -> Params:
 
     `p["bn"]["running_var"]`, `p["post_quant_conv"]["weight"]`, `p["decoder"]["conv_in.weight"]`,
     `p["decoder.up_blocks"]["0.resnets.0.conv1.weight"]`. `load_flat` asserts the key set in both
-    directions; the 109 encoder-side tensors are *declared* ignorable, and their count is asserted
+    directions; the 108 encoder-side tensors are *declared* ignorable, and their count is asserted
     so a reshaped checkpoint cannot pass silently.
     """
     ignored = tuple(k for k in header(path) if k.startswith(ENCODER_PREFIXES))
@@ -120,7 +119,7 @@ def _nchw(x: Array) -> Array:
 
 
 def _put(trace: dict[str, Array] | None, key: str, x: Array) -> None:
-    """Record one contract key (`docs/fixture-contract.md`) — NCHW, as the golden file holds it."""
+    """Record one trace key, in NCHW."""
     if trace is not None:
         trace[key] = x
 
@@ -161,8 +160,7 @@ def inv_normalize(p: Params, z: Array, cfg: VAE) -> Array:
 
     The stats are bf16 and stay bf16: `var + eps` rounds to bf16, `sqrt` is fp32-then-bf16 (what
     `torch.sqrt` does to a bf16 tensor), and `z * std + mean` is two eager kernels. Computing the
-    sqrt in fp32 — `docs/port-plan.md` decision #5, and what `tools/dump_reference.py:379` does —
-    moves `z_in` by 3.9e-3 relative, so this function deliberately does not.
+    sqrt in fp32 instead moves `z_in` by 3.9e-3 relative, so this function deliberately does not.
     """
     var, mean = (p["bn"][k].astype(jnp.float32).reshape(1, -1, 1, 1)
                  for k in ("running_var", "running_mean"))
