@@ -16,18 +16,21 @@ prompt ──► Qwen3-4B encoder (27 of 36 layers) ──► ctx ──┐
 
 | | request | text / DiT / VAE |
 |---|---|---|
-| default | 346 ms (2.89 img/s) | 7 / 298 / 37 ms |
-| `attention="bounded"` + `upsample="dilated"` | 306 ms (3.26 img/s) | 7 / 270 / 26 ms |
-| `gemm="smooth_large"` (int8, lossy) | 300 ms | 7 / 251 / 37 ms |
+| default | 306 ms (3.27 img/s) | 7 / 270 / 26 ms |
+| `attention="flash"`, `upsample="nearest"` | 346 ms (2.89 img/s) | 7 / 299 / 37 ms |
 
-The last two rows are opt-in. `attention="bounded"` is an attention kernel without flash's running
-max (legal because QK-norm bounds the logits); `upsample="dilated"` runs the VAE's nearest-2x + 3x3
-conv as one 4x4 conv. Together they pass two of the three quality conditions and miss the third
-narrowly, so they are off by default.
+The default attention kernel drops flash attention's running max, which is legal because QK-norm
+bounds the logits (checked at load); the default VAE runs each nearest-2x + 3x3 conv as one 4x4
+conv. The second row is the library flash kernel and the reference's literal upsample.
 
-The DiT and VAE are gated against the PyTorch reference on 96 image pairs, fed the reference's
-own text conditioning. With flicker's text encoder the images drift further from PyTorch
-(LPIPS ≈ 0.04), because bf16 padding-token states are sensitive to operation order.
+Quality is gated against the PyTorch reference on 96 image pairs, fed the reference's own text
+conditioning: LPIPS median 0.0056 and step-latent SNR 36.4 dB pass their floors; DINO p5 is 0.9819
+against a 0.9835 floor, a miss inside the noise of a paired comparison with the flash kernel, which
+passes all three. With flicker's text encoder the images drift further from PyTorch (LPIPS ≈ 0.04),
+because bf16 padding-token states are sensitive to operation order.
+
+An int8 tier (258 ms, LPIPS 0.013) lives at the `int8-tier` tag; it fails the gate and is not on
+`main`.
 
 ## usage
 
