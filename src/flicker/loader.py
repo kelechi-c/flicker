@@ -1,20 +1,3 @@
-"""safetensors -> nested pytree, one tensor at a time.
-
-Three rules and no renaming table:
-
-| torch | jax |
-|---|---|
-| `*.weight` on a `Linear` | `transpose` -> `(in, out)` |
-| `*.weight` on a `Conv2d` (4-D) | `transpose(2,3,1,0)` -> `HWIO` |
-| `*.scale`, everything else | as-is (QKNorm scales stay **bf16**) |
-
-The tree nests **one** level at the module the consuming function takes as an argument, and keeps
-the rest of the torch path dotted: `p["time_in"]["in_layer.weight"]`,
-`p["double_blocks"]["img_attn.qkv.weight"]` (leading axis = block index, ready for `lax.scan`).
-The key set is asserted in **both** directions — a missing key and an unexpected key are both
-hard errors, because a `ShapeDtypeStruct`-template loader silently no-ops otherwise.
-"""
-
 import functools
 import inspect
 import json
@@ -31,9 +14,6 @@ from .kernels import EXP_LIMIT, logit_bound
 Array = jax.Array
 Tree = dict[str, Array]
 
-# `backend="pread"` makes `safe_open` read lazily from disk instead of mapping the whole file, which
-# is the measured 1.24x-RAM path here. It is only accepted from safetensors 0.5 on, and the reference
-# images pin 0.4.5 for the BFL checkout, so feature-detect rather than require it.
 _PREAD = "backend" in inspect.signature(safe_open).parameters
 open_np = functools.partial(
     safe_open, framework="np", **({"backend": "pread"} if _PREAD else {})
@@ -41,18 +21,13 @@ open_np = functools.partial(
 
 
 def header(path: str) -> dict[str, tuple[str, tuple[int, ...]]]:
-    """`{key: (dtype, shape)}` without reading any tensor data."""
     with safe_open(path, framework="np") as f:
-        return {k: (str(f.get_slice(k).get_dtype()), tuple(f.get_slice(k).get_shape())) for k in f.keys()}  # noqa: SIM118 (not iterable)
+        return {k: (str(f.get_slice(k).get_dtype()), tuple(f.get_slice(k).get_shape())) for k in f.keys()}  # noqa: SIM118
 
 
+# stream tensors one at a time, transpose to jax layout, assert the key set both ways
 def load_flat(path: str, expected: set[str], transpose: tuple[str, ...] = ("weight",),
               ignore: tuple[str, ...] = ()) -> dict[str, np.ndarray]:
-    """Stream every expected tensor, transposing per the rules above; assert the key set.
-
-    `safe_open(backend="pread")` + `get_tensor` one at a time is the measured 1.24x-host-RAM
-    path — never `load_file`.
-    """
     with open_np(path) as f:
         found = set(f.keys()) - set(ignore)
         missing, extra = expected - found, found - expected
@@ -62,7 +37,6 @@ def load_flat(path: str, expected: set[str], transpose: tuple[str, ...] = ("weig
 
 
 def _orient(w: np.ndarray, key: str, transpose: tuple[str, ...]) -> np.ndarray:
-    """Transpose to JAX layout: 4-D conv kernels OIHW->HWIO, 2-D linear weights (out,in)->(in,out)."""
     if not key.endswith(transpose):
         return w
     if w.ndim == 4:
@@ -73,7 +47,6 @@ def _orient(w: np.ndarray, key: str, transpose: tuple[str, ...]) -> np.ndarray:
 
 
 def nest(flat: Tree) -> Tree:
-    """`{"a.b.c": x}` -> `{"a": {"b.c": x}}` — one level of grouping by consuming module."""
     out: Tree = {}
     for key, value in flat.items():
         head, _, rest = key.partition(".")
@@ -81,8 +54,8 @@ def nest(flat: Tree) -> Tree:
     return out
 
 
+# stack per-block weights on a leading axis for lax.scan
 def stack_blocks(flat: Tree, prefix: str, count: int) -> Tree:
-    """`{prefix.i.rest}` -> `{rest: stacked with leading axis i}` for `lax.scan`."""
     out: Tree = {}
     for index in range(count):
         head = f"{prefix}.{index}."
@@ -94,7 +67,6 @@ def stack_blocks(flat: Tree, prefix: str, count: int) -> Tree:
 
 
 def dit_keys(cfg: Klein4B) -> set[str]:
-    """The 149 tensor names of `flux-2-klein-4b.safetensors`."""
     keys = {
         "img_in.weight",
         "txt_in.weight",
@@ -126,8 +98,8 @@ def dit_keys(cfg: Klein4B) -> set[str]:
     return keys
 
 
+# dit checkpoint -> scan-ready pytree on device, with the bounded-attention safety check
 def load_dit(path: str, cfg: Klein4B) -> Tree:
-    """Stream the DiT checkpoint into the scan-ready pytree of device arrays."""
     flat = load_flat(path, dit_keys(cfg))
     blocks = {
         "double_blocks": stack_blocks(flat, "double_blocks", cfg.depth),
@@ -139,12 +111,8 @@ def load_dit(path: str, cfg: Klein4B) -> Tree:
     return jax.device_put(nest(top) | blocks)
 
 
+# refuse bounded attention if these weights let exp overflow
 def check_logit_bound(blocks: Tree) -> None:
-    """Refuse `attention="bounded"` for weights whose QK-norm scales allow `exp` to overflow.
-
-    The double blocks attend over `[txt | img]` jointly, so their bound takes the larger scale of
-    the two streams on each side.
-    """
     double, single = blocks["double_blocks"], blocks["single_blocks"]
 
     def joint(name: str) -> np.ndarray:
@@ -164,8 +132,6 @@ EMBED_KEY = "model.embed_tokens.weight"
 
 
 def text_keys(cfg: Qwen3_4B) -> set[str]:
-    """The 298 tensors of Qwen3 layers 0-26 plus the embedding — layers 27-35 and the LM head
-    are never run (we tap `hidden_states[27]`), which is ~25 % of the encoder."""
     keys = {EMBED_KEY}
     for i in range(cfg.layers_needed):
         keys |= {
@@ -184,12 +150,8 @@ def text_keys(cfg: Qwen3_4B) -> set[str]:
     return keys
 
 
+# only layers 0-26 and the embedding are read; the rest of qwen3 is never run
 def load_text(index_path: str, cfg: Qwen3_4B) -> Tree:
-    """Stream the two Qwen3 shards through their HF index, keeping only the layers we run.
-
-    Each shard is opened once and read with `pread`; only the keys the index maps to it are
-    touched, so the 9 unused layers are never materialised. Returns device arrays.
-    """
     weight_map = json.loads(pl.Path(index_path).read_text())["weight_map"]
     expected = text_keys(cfg)
     missing = expected - set(weight_map)
@@ -198,7 +160,6 @@ def load_text(index_path: str, cfg: Qwen3_4B) -> Tree:
     for shard in sorted({weight_map[k] for k in expected}):
         keys = sorted(k for k in expected if weight_map[k] == shard)
         with open_np(str(pl.Path(index_path).parent / shard)) as f:
-            # the embedding is a lookup table, not a Linear: it must not be transposed
             flat |= {
                 k: f.get_tensor(k) if k == EMBED_KEY else _orient(f.get_tensor(k), k, ("weight",))
                 for k in keys

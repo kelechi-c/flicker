@@ -1,14 +1,3 @@
-"""per-stage and per-op device time of a traced request, from an xprof trace. local, no accelerator.
-
-    uv run --no-project --with xprof python tools/op_profile.py out/trace --iterations 3
-
-xprof's `op_profile` gives every hlo op an inclusive time, flop count and bytes accessed; subtracting
-the children leaves each op's own share, and those shares sum back to the device total. ops are then
-grouped by the stage whose jit they sit in and by the python line that produced them, so the table
-needs no knowledge of this revision's line numbers. `--iterations` is how many requests the trace
-holds (3 for `tools/bench.py --trace`); every figure is per request.
-"""
-
 import argparse
 import collections
 import json
@@ -20,7 +9,6 @@ STAGES = ("jit(encode)", "jit(denoise)", "jit(vae_decode)")
 
 
 class Op(NamedTuple):
-    """one hlo op's own (exclusive) share of the trace."""
 
     stage: str
     source: str
@@ -31,7 +19,6 @@ class Op(NamedTuple):
 
 
 def tree(xplane: pl.Path) -> Json:
-    """xplane -> xprof's hierarchical op profile."""
     from xprof.convert import raw_to_tool_data
 
     data, ok = raw_to_tool_data.xspace_to_tool_data([str(xplane)], "op_profile", {})
@@ -41,10 +28,9 @@ def tree(xplane: pl.Path) -> Json:
 
 
 def flatten(node: Json) -> list[Op]:
-    """every node as an `Op`, with its children's metrics subtracted."""
     children = node.get("children") or []
     metrics, info = node["metrics"], node.get("xla") or {}
-    own = lambda key: metrics[key] - sum(c["metrics"][key] for c in children)  # noqa: E731
+    own = lambda key: metrics[key] - sum(c["metrics"][key] for c in children)
     moved = sum(metrics["rawBytesAccessedArray"][i] - sum(c["metrics"]["rawBytesAccessedArray"][i]
                                                          for c in children) for i in (0, 2))
     prov = (info.get("provenance") or "").rstrip(":")
@@ -56,17 +42,16 @@ def flatten(node: Json) -> list[Op]:
 
 
 def table(rows: dict[tuple[str, ...], list[float]], iterations: int, limit: int) -> list[str]:
-    """`ms  tflop/s  gb/s  key` lines, largest first."""
     out = []
     for key, (seconds, flops, moved) in sorted(rows.items(), key=lambda kv: -kv[1][0])[:limit]:
-        rate = lambda x: x / seconds / 1e12 if seconds else 0.0  # noqa: E731
-        out.append(f"{1e3 * seconds / iterations:9.3f} ms {rate(flops):7.1f} tf/s "
-                   f"{1e3 * rate(moved):7.0f} gb/s  {'  '.join(key)}")
+        tflops, gbps = (x / seconds / 1e12 if seconds else 0.0 for x in (flops, moved))
+        out.append(f"{1e3 * seconds / iterations:9.3f} ms {tflops:7.1f} tf/s "
+                   f"{1e3 * gbps:7.0f} gb/s  {'  '.join(key)}")
     return out
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser()
     parser.add_argument("trace", type=pl.Path, help="a trace directory or one .xplane.pb")
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--top", type=int, default=15, help="ops listed per stage")

@@ -1,12 +1,3 @@
-"""prompts -> pngs, and an optional contact sheet.
-
-    uv run python tools/generate.py "a misty forest at dawn" --out out/images
-    uv run python tools/generate.py --prompts prompts.txt --grid 5 --out out/images
-
-weights come from `black-forest-labs/FLUX.2-klein-4B` (gated: needs `HF_TOKEN`) unless `--weights`
-points at a local copy. needs a 32 GB accelerator: everything is loaded once and kept.
-"""
-
 import argparse
 import json
 import pathlib as pl
@@ -22,7 +13,6 @@ FILES = (DIT_FILE, "text_encoder/*", "tokenizer/*", "vae/*")
 
 
 def weights(root: str | None = None) -> Paths:
-    """the three checkpoint paths, downloaded on first use."""
     snap = pl.Path(root or snapshot_download(REPO, allow_patterns=list(FILES)))
     return Paths(dit=str(snap / DIT_FILE),
                  text_index=str(snap / "text_encoder/model.safetensors.index.json"),
@@ -30,14 +20,13 @@ def weights(root: str | None = None) -> Paths:
 
 
 def grid(images: list[np.ndarray], columns: int) -> np.ndarray:
-    """equal-size `(h, w, 3)` images -> one sheet, row-major, `columns` wide."""
     assert len(images) % columns == 0, f"{len(images)} images do not fill rows of {columns}"
     rows = [np.concatenate(images[i:i + columns], axis=1) for i in range(0, len(images), columns)]
     return np.concatenate(rows, axis=0)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser()
     parser.add_argument("prompt", nargs="*")
     parser.add_argument("--prompts", type=pl.Path, help="a file with one prompt per line")
     parser.add_argument("--out", type=pl.Path, default=pl.Path("out/images"))

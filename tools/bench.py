@@ -1,13 +1,3 @@
-"""latency of one warm request and of each stage, on whatever accelerator jax sees.
-
-    uv run python tools/bench.py                     # 1024², 20 reps, one json on stdout
-    uv run python tools/bench.py --trace out/trace   # also capture an xprof trace of 3 requests
-
-every timing is a blocked call (`block_until_ready`) after 3 warmups; p50 over `--reps`. the request
-includes host tokenisation and the uint8 conversion; the stages are the three jitted device calls.
-read a trace with `tools/op_profile.py <trace dir> --iterations 3`.
-"""
-
 import argparse
 import json
 import pathlib as pl
@@ -16,19 +6,23 @@ import time
 from collections.abc import Callable
 
 import jax
+from generate import weights
 
 from flicker.config import Config
-from flicker.pipeline import decode_from, denoise_from, encode_ctx, generate_resident, load_all
-from generate import weights
+from flicker.pipeline import (
+    decode_from,
+    denoise_from,
+    encode_ctx,
+    generate_resident,
+    load_all,
+)
 
 PROMPT = "a car jumping off of a cliff with a crowd cheering"
 WARMUPS = 3
-# matmul + conv + attention flops of one 1024² request, summed from an xprof op profile
 FLOPS_1024 = 153.0e12
 
 
 def p50_ms(fn: Callable[[], object], reps: int) -> float:
-    """median wall time of `fn`, device work included, after `WARMUPS` untimed calls."""
     for _ in range(WARMUPS):
         jax.block_until_ready(fn())
     times = []
@@ -40,7 +34,7 @@ def p50_ms(fn: Callable[[], object], reps: int) -> float:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser()
     parser.add_argument("--size", type=int, default=1024)
     parser.add_argument("--reps", type=int, default=20)
     parser.add_argument("--weights", help="local snapshot of the model repo")
@@ -52,7 +46,7 @@ def main() -> None:
     res = load_all(weights(args.weights), cfg)
     load_s = time.perf_counter() - start
     key = jax.random.key(0)
-    request = lambda: generate_resident(res, cfg, PROMPT, size, size)  # noqa: E731
+    request = lambda: generate_resident(res, cfg, PROMPT, size, size)
 
     start = time.perf_counter()
     request()

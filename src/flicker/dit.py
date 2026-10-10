@@ -18,7 +18,7 @@ def block_params(p: dict[str, Array], key: str) -> dict[str, Array]:
     return p[key]
 
 
-# t2i velocity prediction; x (1,L,128), ctx (1,512,7680), t - (B,)
+# one t2i velocity prediction: modulation -> 5 double blocks -> 20 single blocks (both lax.scan) -> final layer
 def forward(
     p: dict[str, Array],
     cfg: Klein4B,
@@ -28,17 +28,8 @@ def forward(
     ctx: Array,
     ctx_ids: Array,
 ) -> Array:
-    """One t2i velocity prediction. `cfg.attention` picks the attention kernel: the Pallas flash
-    kernel on TPU, plain `sdpa` everywhere else (so CPU tests never need Pallas). Resolved once,
-    here, and threaded into every block — a rebind of the module global is silently ignored by
-    jit's trace cache, and `cfg` is a static argument, so each choice is its own cache entry.
-    `cfg.qk_prep` picks the q/k/v prep the same way: `kernels.qk_prep` on TPU, the XLA chain
-    (`heads` + `qk_norm` + `apply_rope`) off it. The kernel's rope tables are derived **once per
-    step** here, outside the 25-block scan, and threaded down as `freqs`.
-    """
     on_tpu = jax.default_backend() == "tpu"
-    # "bounded" needs q pre-scaled by the qk-prep kernel and a 128-multiple in both streams;
-    # anything else keeps the library flash kernel, so the choice is made once, here.
+    # the bounded kernel needs the fused qk-prep and 128-multiple streams; otherwise fall back to flash/sdpa
     bounded = (cfg.attention == "bounded" and cfg.qk_prep == "kernel" and on_tpu
                and x.shape[1] % 128 == 0 and ctx.shape[1] % 128 == 0)
     attend = bounded_attend if bounded else flash_sdpa if cfg.attention != "sdpa" and on_tpu else sdpa

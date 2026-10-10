@@ -1,6 +1,3 @@
-# Qwen3-4B text encoder, bf16, **27 of 36 layers**. tap `hidden_states[9, 18, 27]`.
-# Reference: `flux2/src/flux2/text_encoder.py:366-428` (which loads the FP8 checkpoint)
-
 import functools
 import json
 from collections.abc import Sequence
@@ -24,7 +21,7 @@ from .config import (
 from .modules import qwen3_layer
 
 Array = jax.Array
-ArrayLike = Array | np.ndarray  # host ids/mask are converted by the jit boundary, not eagerly
+ArrayLike = Array | np.ndarray
 TOKENIZER_REVISION = "e7b7dc27f91deacad38e78976d1f2b499d76a294"
 
 
@@ -42,7 +39,6 @@ def load_tokenizer(revision: str | None = None) -> tuple[Tokenizer, int]:
     with open(cfg_file) as file:
         config = json.load(file)
     tokenizer = Tokenizer.from_file(tok_file)
-    # `pad_token_id` is not in the config: it stores the *string*, and the id lives in the vocab.
     return tokenizer, int(tokenizer.token_to_id(config["pad_token"]))
 
 
@@ -59,12 +55,10 @@ def tokenize(prompt: str | Sequence[str]) -> Tokens:
     return Tokens(np.asarray(all_ids, np.int32), np.asarray(all_masks, np.int32))
 
 
-# `model.embed_tokens` lookup: (B,S) ids -> (B,S,2560)
 def embed(p: dict[str, Array], ids: ArrayLike) -> Array:
     return p["embed_tokens"]["weight"][ids]
 
 
-# `Qwen3RotaryEmbedding.forward`: fp32 frequencies, `cos/sin`
 def rope_tables(positions: Array, head_dim: int, theta: float) -> tuple[Array, Array]:
     inv_freq = 1.0 / (theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
     angles = positions.astype(jnp.float32)[:, None] * inv_freq[None]
@@ -78,9 +72,7 @@ def causal_mask(mask: ArrayLike) -> Array:
     return (mask[:, None, None, :] > 0) & causal
 
 
-# One `lax.scan` over layers 0-26; the body returns its output as the carry and as `ys`, so the
-# taps are plain slices of `ys`. `hidden_states[k]` is the output of layer `k-1`, so tap `k` is
-# `ys[k-1]` (9/18/27 -> the outputs of layers 8/17/26). Three 9-layer scans cost 2.3x this on TPU.
+# one lax.scan over the 27 layers, tapping hidden states at TAP_LAYERS
 def trunk(p: dict[str, Array], cfg: Qwen3_4B, tokens: Tokens) -> list[Array]:
     x = embed(p, tokens.ids)
     cos, sin = rope_tables(jnp.arange(MAX_LENGTH), cfg.head_dim, cfg.rope_theta)
@@ -94,6 +86,6 @@ def trunk(p: dict[str, Array], cfg: Qwen3_4B, tokens: Tokens) -> list[Array]:
     return [ys[k - 1] for k in TAP_LAYERS]
 
 
-# `Qwen3Embedder.forward` (`text_encoder.py:383-419`)
+# stack the 3 tapped states into the (B, 512, 7680) dit context
 def encode(p: dict[str, Array], cfg: Qwen3_4B, tokens: Tokens) -> Array:
     return jnp.concatenate(trunk(p, cfg, tokens), axis=-1)

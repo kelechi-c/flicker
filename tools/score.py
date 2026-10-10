@@ -1,24 +1,13 @@
-"""paired image quality of a candidate directory against a reference directory.
-
-    uv run --extra quality python tools/score.py out/reference out/candidate
-
-images are paired by file name. per pair: lpips (pyiqa, alex) and the dinov2 cls cosine, both from
-`quality_metrics`. the two statistics printed are the ones flicker gates on: the lpips median and the
-dino 5th percentile. generate both sides from the same prompts, seeds and initial noise, or the
-score measures the sampler's sensitivity instead of the implementation.
-"""
-
 import argparse
 import json
 import pathlib as pl
 
 import numpy as np
-
 from quality_metrics import decode_rgb, default_scorers
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser()
     parser.add_argument("reference", type=pl.Path)
     parser.add_argument("candidate", type=pl.Path)
     args = parser.parse_args()
